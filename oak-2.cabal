@@ -11,7 +11,7 @@ cabal-version:      3.0
 --   http://haskell.org/cabal/users-guide/
 --
 -- The name of the package.
-name:               oak-2
+name:               oak
 
 -- The package version.
 -- See the Haskell package versioning policy (PVP) for standards
@@ -68,7 +68,8 @@ executable oak-2
     -- other-extensions:
 
     -- Other library packages from which modules are imported.
-    build-depends:    base ^>=4.17.2.0
+    build-depends:    base ^>=4.17.2.0,
+                      parsec
 
     -- Directories containing source files.
     hs-source-dirs:   app
