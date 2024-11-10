@@ -40,7 +40,7 @@ instance Show Token where
   show (CapturedLambda _) = "<captured lambda>"
   show (Quote expr) = "(quote " ++ show expr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
-  show (Call fn args) = "call(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
+  show (Call fn args) = "(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
   show (ParseError err) = "Error: " ++ err
   show _ = "unknown expression"
 
@@ -292,22 +292,29 @@ repl str (c : cs) =
         res <- eval expr
         repl (str ++ "\n\n> " ++ c ++ "\n = " ++ show res) cs
 
-nativeFn :: (Integer -> Integer -> Integer) -> Token -> Token -> Computation Token
-nativeFn fn argA argB = do
+nativeFn :: String -> (Integer -> Integer -> Integer) -> Token -> Token -> Computation Token
+nativeFn fnName fn argA argB = do
   evalA <- eval argA
   evalB <- eval argB
   case (evalA, evalB) of
     (EInteger x, EInteger y) -> return $ EInteger (fn x y)
-    _ -> return $ ParseError "Don't know how to multiply non-numbers"
+    (Name _, Name _) -> return $ Call (Name fnName) [evalA, evalB]
+    (Name _, _) -> return $ Call (Name fnName) [evalA, evalB]
+    (_, Name _) -> return $ Call (Name fnName) [evalA, evalB]
+    (_, _) -> return $ ParseError ("Built-in \"" ++ fnName ++ "\" doesn't know how to handle arguments: \"" ++ show evalA ++ "\" and \"" ++ show evalB ++ "\"")
 
 eval :: Token -> Computation Token
-eval (Call (Name "+") [xExpr, yExpr]) = nativeFn (+) xExpr yExpr
-eval (Call (Name "-") [xExpr, yExpr]) = nativeFn (-) xExpr yExpr
-eval (Call (Name "*") [xExpr, yExpr]) = nativeFn (*) xExpr yExpr
-eval (Call (Name "/") [xExpr, yExpr]) = nativeFn div xExpr yExpr
-eval (Call (Name "%") [xExpr, yExpr]) = nativeFn rem xExpr yExpr
+eval (Call (Name "+") [xExpr, yExpr]) = nativeFn "+" (+) xExpr yExpr
+eval (Call (Name "-") [xExpr, yExpr]) = nativeFn "-" (-) xExpr yExpr
+eval (Call (Name "*") [xExpr, yExpr]) = nativeFn "*" (*) xExpr yExpr
+eval (Call (Name "/") [xExpr, yExpr]) = nativeFn "/" div xExpr yExpr
+eval (Call (Name "%") [xExpr, yExpr]) = nativeFn "%" rem xExpr yExpr
 eval (Quote expr) = return expr
-eval (Call (Name "eval") [Quote expr]) = eval expr
+eval (Call (Name "eval") [expr]) = do
+  res <- eval expr
+  case res of
+    Quote quotedExpr -> eval quotedExpr
+    _ -> eval res
 eval (Let bindings expression) = do
   inChildEnv
     ( do
@@ -373,10 +380,21 @@ main =
           "((lambda (arg) (* arg arg)) 5)",
           "arg",
           "(define square (lambda (arg) (* arg arg)))",
+          "square",
+          "(square)",
           "(square x y)",
           "(square x)",
           "(square z)",
+          "(define mass (quote m))",
+          "mass",
+          "m",
+          "(eval mass)",
+          "(define m 88)",
+          "mass",
+          "(eval mass)",
           "(quote (square x))",
+          "(* (quote height) (quote mass))",
+          "(* x (quote mass))",
           "(square (quote x))",
           "(eval (quote (square x)))",
           "((eval (quote square)) x)",
