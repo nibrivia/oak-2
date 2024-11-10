@@ -1,3 +1,6 @@
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+
+{-# HLINT ignore "Use <$>" #-}
 module Main (main) where
 
 import Control.Applicative
@@ -16,6 +19,7 @@ data Token
   | EString String
   | Name String
   | Lambda [String] Token
+  | Let [(String, Token)] Token
   | CapturedLambda ([Token] -> Computation Token)
   | Quote Token
   | IfElse Token Token Token
@@ -36,7 +40,7 @@ instance Show Token where
   show (CapturedLambda _) = "<captured lambda>"
   show (Quote expr) = "(quote " ++ show expr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
-  show (Call fn args) = "(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
+  show (Call fn args) = "call(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
   show (ParseError err) = "Error: " ++ err
   show _ = "unknown expression"
 
@@ -48,7 +52,7 @@ parseName = do
       <|> Parsec.string "/"
       <|> Parsec.string "-"
       <|> Parsec.string "%"
-      <|> Parsec.many1 Parsec.letter
+      <|> parseNamestring
   return (Name name_str)
 
 parseString :: Parsec.Parsec String () Token
@@ -62,31 +66,54 @@ parseInt = do
   integer_str <- Parsec.many1 Parsec.digit
   return (EInteger (read integer_str))
 
-parseCall :: Parsec.Parsec String () Token
-parseCall = do
+inParens :: Parsec.Parsec String () a -> Parsec.Parsec String () a
+inParens parser = do
   openCall
-  name <- parseExpression
-  arguments <-
-    Parsec.many
-      ( do
-          separator
-          parseExpression
-      )
+  res <- parser
   closeCall
-  return (Call name arguments)
+  return res
+
+parseCall :: Parsec.Parsec String () Token
+parseCall =
+  inParens $ do
+    name <- parseExpression
+    arguments <-
+      Parsec.many
+        ( do
+            separator
+            parseExpression
+        )
+    return (Call name arguments)
 
 parseLambda :: Parsec.Parsec String () Token
 parseLambda = do
-  openCall
-  parseKeyword "lambda"
-  separator
-  openCall
-  args <- Parsec.many1 Parsec.letter `Parsec.sepBy` separator
-  closeCall
-  separator
-  body <- parseExpression
-  closeCall
-  return (Lambda args body)
+  inParens $
+    do
+      parseKeyword "lambda"
+      separator
+      args <- inParens $ do
+        parseNamestring `Parsec.sepBy` separator
+      separator
+      Lambda args <$> parseExpression
+
+parseTuple :: Parsec.Parsec String () (String, Token)
+parseTuple =
+  inParens $ do
+    name <- parseNamestring
+    separator
+    value <- parseExpression
+    return (name, value)
+
+parseLet :: Parsec.Parsec String () Token
+parseLet = do
+  inParens $ do
+    parseKeyword "let"
+    separator
+    bindings <- inParens $ do parseTuple `Parsec.sepBy` separator
+
+    separator
+    body <- parseExpression
+    return (Let bindings body)
 
 closeCall :: Parsec.Parsec String () ()
 closeCall = do
@@ -105,60 +132,61 @@ parseKeyword keyword = do
   _ <- Parsec.string keyword
   return ()
 
+parseNamestring :: Parsec.Parsec String () String
+parseNamestring = do
+  Parsec.many1 Parsec.letter
+
 separator :: Parsec.Parsec String () ()
 separator = do
   _ <- Parsec.many1 Parsec.space
   return ()
 
 parseDefineType :: Parsec.Parsec String () Token
-parseDefineType = do
-  openCall
-  parseKeyword "defineType"
-  separator
-  name <- Parsec.many1 Parsec.letter
-  separator
-  value <- parseExpression
-  closeCall
-  return (DefineType name value)
+parseDefineType =
+  inParens $ do
+    parseKeyword "defineType"
+    separator
+    name <- parseNamestring
+    separator
+    value <- parseExpression
+    return (DefineType name value)
 
 parseIfElse :: Parsec.Parsec String () Token
-parseIfElse = do
-  openCall
-  parseKeyword "if"
-  separator
-  condExpr <- parseExpression
-  separator
-  trueExpr <- parseExpression
-  separator
-  falseExpr <- parseExpression
-  closeCall
-  return (IfElse condExpr trueExpr falseExpr)
+parseIfElse =
+  inParens $ do
+    parseKeyword "if"
+    separator
+    condExpr <- parseExpression
+    separator
+    trueExpr <- parseExpression
+    separator
+    falseExpr <- parseExpression
+    return (IfElse condExpr trueExpr falseExpr)
 
 parseDefine :: Parsec.Parsec String () Token
-parseDefine = do
-  openCall
-  parseKeyword "define"
-  separator
-  name <- Parsec.many1 Parsec.letter
-  separator
-  value <- parseExpression
-  closeCall
-  return (Define name value)
+parseDefine =
+  inParens $ do
+    parseKeyword "define"
+    separator
+    name <- parseNamestring
+    separator
+    value <- parseExpression
+    return (Define name value)
 
 parseQuote :: Parsec.Parsec String () Token
 parseQuote = do
-  openCall
-  _ <- Parsec.string "quote"
-  separator
-  expression <- parseExpression
-  closeCall
-  return (Quote expression)
+  inParens $ do
+    _ <- Parsec.string "quote"
+    separator
+    expression <- parseExpression
+    return (Quote expression)
 
 parseExpression :: Parsec.Parsec String () Token
 parseExpression =
   parseInt
     <|> parseString
     <|> parseName
+    <|> Parsec.try parseLet
     <|> Parsec.try parseLambda
     <|> Parsec.try parseDefine
     <|> Parsec.try parseDefineType
@@ -246,7 +274,7 @@ readBinding name =
          in case (lookupRes, parent) of
               (Just value, _) -> (env, value)
               (Nothing, Just parentEnv) -> compute parentEnv (readBinding name)
-              (Nothing, Nothing) -> (env, ParseError "name not found")
+              (Nothing, Nothing) -> (env, ParseError ("name '" ++ name ++ "' not found"))
     )
 
 -- | The default environment is not the empty environment!
@@ -256,7 +284,10 @@ defaultEnv = emptyEnv
 repl :: String -> [String] -> Computation String
 repl final [] = pure final
 repl str (c : cs) =
-  let expr = Either.fromRight (ParseError "parseError") (Parsec.parse parseTopExpression "(source)" c)
+  let expr =
+        c
+          & Parsec.parse parseTopExpression "(source)"
+          & Either.either (\err -> err & show & ParseError) id
    in do
         res <- eval expr
         repl (str ++ "\n\n> " ++ c ++ "\n = " ++ show res) cs
@@ -277,6 +308,12 @@ eval (Call (Name "/") [xExpr, yExpr]) = nativeFn div xExpr yExpr
 eval (Call (Name "%") [xExpr, yExpr]) = nativeFn rem xExpr yExpr
 eval (Quote expr) = return expr
 eval (Call (Name "eval") [Quote expr]) = eval expr
+eval (Let bindings expression) = do
+  inChildEnv
+    ( do
+        foldM_ (\_ (name, value) -> do bind name value) () bindings
+        eval expression
+    )
 eval (Define name expression) = do
   evaluatedExpression <- eval expression
   bind name evaluatedExpression
@@ -329,6 +366,9 @@ main =
           "(define y (+ x 2))",
           "(+ x y)",
           "(+ x (* y 3))",
+          "(let ((a 1)) a)",
+          "(let ((z 12)) (/ z 4))",
+          "z",
           "(lambda (arg) (* arg arg))",
           "((lambda (arg) (* arg arg)) 5)",
           "arg",
