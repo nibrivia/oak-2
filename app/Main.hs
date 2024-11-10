@@ -11,20 +11,24 @@ import Debug.Trace
 import Text.Parsec ((<?>))
 import qualified Text.Parsec as Parsec
 
-data Expression
+data Token
   = EInteger Integer
   | EString String
   | Name String
-  | Lambda [String] Expression
-  | CapturedLambda ([Expression] -> Computation Expression)
-  | Quote Expression
-  | IfElse Expression Expression Expression
-  | Define String Expression
-  | DefineType String Expression
-  | Call Expression [Expression]
-  | RuntimeError String
+  | Lambda [String] Token
+  | CapturedLambda ([Token] -> Computation Token)
+  | Quote Token
+  | IfElse Token Token Token
+  | Define String Token
+  | DefineType String Token
+  | Call Token [Token]
+  | ParseError String
 
-instance Show Expression where
+data Expression
+  = Okay Token
+  | RuntimeError2 String
+
+instance Show Token where
   show (EInteger x) = show x
   show (EString s) = "\"" ++ s ++ "\""
   show (Name s) = s
@@ -33,10 +37,10 @@ instance Show Expression where
   show (Quote expr) = "(quote " ++ show expr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
   show (Call fn args) = "(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
-  show (RuntimeError err) = "Error: " ++ err
+  show (ParseError err) = "Error: " ++ err
   show _ = "unknown expression"
 
-parseName :: Parsec.Parsec String () Expression
+parseName :: Parsec.Parsec String () Token
 parseName = do
   name_str <-
     Parsec.string "+"
@@ -47,18 +51,18 @@ parseName = do
       <|> Parsec.many1 Parsec.letter
   return (Name name_str)
 
-parseString :: Parsec.Parsec String () Expression
+parseString :: Parsec.Parsec String () Token
 parseString = do
   _ <- Parsec.char '"'
   str <- Parsec.manyTill Parsec.anyChar (Parsec.char '"')
   return (EString str)
 
-parseInt :: Parsec.Parsec String () Expression
+parseInt :: Parsec.Parsec String () Token
 parseInt = do
   integer_str <- Parsec.many1 Parsec.digit
   return (EInteger (read integer_str))
 
-parseCall :: Parsec.Parsec String () Expression
+parseCall :: Parsec.Parsec String () Token
 parseCall = do
   openCall
   name <- parseExpression
@@ -71,13 +75,13 @@ parseCall = do
   closeCall
   return (Call name arguments)
 
-parseLambda :: Parsec.Parsec String () Expression
+parseLambda :: Parsec.Parsec String () Token
 parseLambda = do
   openCall
   parseKeyword "lambda"
   separator
   openCall
-  args <- (Parsec.many1 Parsec.letter) `Parsec.sepBy` separator
+  args <- Parsec.many1 Parsec.letter `Parsec.sepBy` separator
   closeCall
   separator
   body <- parseExpression
@@ -106,7 +110,7 @@ separator = do
   _ <- Parsec.many1 Parsec.space
   return ()
 
-parseDefineType :: Parsec.Parsec String () Expression
+parseDefineType :: Parsec.Parsec String () Token
 parseDefineType = do
   openCall
   parseKeyword "defineType"
@@ -117,7 +121,7 @@ parseDefineType = do
   closeCall
   return (DefineType name value)
 
-parseIfElse :: Parsec.Parsec String () Expression
+parseIfElse :: Parsec.Parsec String () Token
 parseIfElse = do
   openCall
   parseKeyword "if"
@@ -130,7 +134,7 @@ parseIfElse = do
   closeCall
   return (IfElse condExpr trueExpr falseExpr)
 
-parseDefine :: Parsec.Parsec String () Expression
+parseDefine :: Parsec.Parsec String () Token
 parseDefine = do
   openCall
   parseKeyword "define"
@@ -141,7 +145,7 @@ parseDefine = do
   closeCall
   return (Define name value)
 
-parseQuote :: Parsec.Parsec String () Expression
+parseQuote :: Parsec.Parsec String () Token
 parseQuote = do
   openCall
   _ <- Parsec.string "quote"
@@ -150,7 +154,7 @@ parseQuote = do
   closeCall
   return (Quote expression)
 
-parseExpression :: Parsec.Parsec String () Expression
+parseExpression :: Parsec.Parsec String () Token
 parseExpression =
   parseInt
     <|> parseString
@@ -162,7 +166,7 @@ parseExpression =
     <|> Parsec.try parseIfElse
     <|> parseCall
 
-parseTopExpression :: Parsec.Parsec String () Expression
+parseTopExpression :: Parsec.Parsec String () Token
 parseTopExpression = do
   expr <- parseExpression
   Parsec.eof
@@ -171,35 +175,7 @@ parseTopExpression = do
 --------------------------------
 -- Evaluation
 
-data Env = Env (Map.Map String Expression) (Maybe Env)
-
-emptyEnv :: Env
-emptyEnv = Env Map.empty Nothing
-
-makeChildEnv :: Env -> Env
-makeChildEnv parentEnv = Env Map.empty (Just parentEnv)
-
-bind :: String -> Expression -> Computation ()
-bind name expression =
-  Computation
-    ( \(Env mappings parentEnv) ->
-        (Env (mappings & Map.insert name expression) parentEnv, ())
-    )
-
-readBinding :: String -> Computation Expression
-readBinding name =
-  Computation
-    ( \env@(Env mappings parent) ->
-        let lookupRes = Map.lookup name mappings
-         in case (lookupRes, parent) of
-              (Just value, _) -> (env, value)
-              (Nothing, Just parentEnv) -> compute parentEnv (readBinding name)
-              (Nothing, Nothing) -> (env, RuntimeError "name not found")
-    )
-
--- | The default environment is not the empty environment!
-defaultEnv :: Env
-defaultEnv = emptyEnv
+data Env = Env (Map.Map String Token) (Maybe Env)
 
 newtype Computation a = Computation (Env -> (Env, a))
 
@@ -238,33 +214,69 @@ instance Monad Computation where
 compute :: Env -> Computation a -> (Env, a)
 compute env (Computation fn) = fn env
 
+computeRes :: Env -> Computation a -> a
+computeRes env computation = let (_, res) = compute env computation in res
+
+emptyEnv :: Env
+emptyEnv = Env Map.empty Nothing
+
+getNewEnv :: Env -> Env
+getNewEnv parentEnv = Env Map.empty (Just parentEnv)
+
+inChildEnv :: Computation a -> Computation a
+inChildEnv comp =
+  Computation
+    ( \parentEnv ->
+        let childEnv = getNewEnv parentEnv
+         in (parentEnv, computeRes childEnv comp)
+    )
+
+bind :: String -> Token -> Computation ()
+bind name expression =
+  Computation
+    ( \(Env mappings parentEnv) ->
+        (Env (mappings & Map.insert name expression) parentEnv, ())
+    )
+
+readBinding :: String -> Computation Token
+readBinding name =
+  Computation
+    ( \env@(Env mappings parent) ->
+        let lookupRes = Map.lookup name mappings
+         in case (lookupRes, parent) of
+              (Just value, _) -> (env, value)
+              (Nothing, Just parentEnv) -> compute parentEnv (readBinding name)
+              (Nothing, Nothing) -> (env, ParseError "name not found")
+    )
+
+-- | The default environment is not the empty environment!
+defaultEnv :: Env
+defaultEnv = emptyEnv
+
 repl :: String -> [String] -> Computation String
 repl final [] = pure final
 repl str (c : cs) =
-  let expr = Either.fromRight (RuntimeError "parseError") (Parsec.parse parseTopExpression "(source)" c)
+  let expr = Either.fromRight (ParseError "parseError") (Parsec.parse parseTopExpression "(source)" c)
    in do
         res <- eval expr
         repl (str ++ "\n\n> " ++ c ++ "\n = " ++ show res) cs
 
-computeRes :: Env -> Computation a -> a
-computeRes env computation = let (_, res) = compute env computation in res
-
-nativeFn :: (Integer -> Integer -> Integer) -> Expression -> Expression -> Computation Expression
+nativeFn :: (Integer -> Integer -> Integer) -> Token -> Token -> Computation Token
 nativeFn fn argA argB = do
   evalA <- eval argA
   evalB <- eval argB
   case (evalA, evalB) of
     (EInteger x, EInteger y) -> return $ EInteger (fn x y)
-    _ -> return $ RuntimeError "Don't know how to multiply non-numbers"
-    
+    _ -> return $ ParseError "Don't know how to multiply non-numbers"
 
-eval :: Expression -> Computation Expression
+eval :: Token -> Computation Token
 eval (Call (Name "+") [xExpr, yExpr]) = nativeFn (+) xExpr yExpr
 eval (Call (Name "-") [xExpr, yExpr]) = nativeFn (-) xExpr yExpr
 eval (Call (Name "*") [xExpr, yExpr]) = nativeFn (*) xExpr yExpr
 eval (Call (Name "/") [xExpr, yExpr]) = nativeFn div xExpr yExpr
 eval (Call (Name "%") [xExpr, yExpr]) = nativeFn rem xExpr yExpr
 eval (Quote expr) = return expr
+eval (Call (Name "eval") [Quote expr]) = eval expr
 eval (Define name expression) = do
   evaluatedExpression <- eval expression
   bind name evaluatedExpression
@@ -275,7 +287,7 @@ eval (Call callExpr argExprs) = do
   fn <- eval callExpr
   case fn of
     CapturedLambda fnComputation ->
-      let args :: Computation [Expression]
+      let args :: Computation [Token]
           args =
             foldM
               ( \acc argExpr -> do
@@ -286,16 +298,21 @@ eval (Call callExpr argExprs) = do
               argExprs
        in args >>= fnComputation
     _ ->
-      pure (RuntimeError ("I don't know how to call: " ++ show fn))
+      pure (ParseError ("I don't know how to call: " ++ show fn))
 eval expr = return expr
 
-evalLambda :: [String] -> Expression -> [Expression] -> Computation Expression
-evalLambda [] body [] = eval body
-evalLambda [] _ _ = return $ RuntimeError "Too many arguments"
-evalLambda _ _ [] = return $ RuntimeError "Not enough arguments"
+evalLambda :: [String] -> Token -> [Token] -> Computation Token
+evalLambda [] body [] = do eval body
+evalLambda [] _ _ = return $ ParseError "Too many arguments"
+evalLambda _ _ [] = return $ ParseError "Not enough arguments"
 evalLambda (n : ns) body (a : as) = do
-  bind n a
-  evalLambda ns body as
+  inChildEnv
+    ( do
+        -- we currently eagerly evaluate
+        -- evalA <- eval a
+        bind n a
+        evalLambda ns body as
+    )
 
 main :: IO ()
 main =
@@ -306,17 +323,24 @@ main =
           "name",
           "(define x 5)",
           "x",
+          "(quote x)",
+          "(eval (quote x))",
           "(+ x 1)",
           "(define y (+ x 2))",
-          "y",
           "(+ x y)",
+          "(+ x (* y 3))",
           "(lambda (arg) (* arg arg))",
           "((lambda (arg) (* arg arg)) 5)",
+          "arg",
           "(define square (lambda (arg) (* arg arg)))",
+          "(square x y)",
           "(square x)",
           "(square z)",
           "(quote (square x))",
-          "(square (quote x))"
+          "(square (quote x))",
+          "(eval (quote (square x)))",
+          "((eval (quote square)) x)",
+          "\"done\""
         ]
 
       evaluations :: Computation String
