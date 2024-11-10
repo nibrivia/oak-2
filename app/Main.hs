@@ -11,8 +11,12 @@ import Data.List
 import qualified Data.Map as Map
 import qualified Data.Maybe as Maybe
 import Debug.Trace
+import System.IO
 import Text.Parsec ((<?>))
 import qualified Text.Parsec as Parsec
+
+debugPipe :: (Show b) => String -> b -> b
+debugPipe name x = trace (name ++ ": " ++ show x) x
 
 data Token
   = EInteger Integer
@@ -36,7 +40,7 @@ instance Show Token where
   show (EInteger x) = show x
   show (EString s) = "\"" ++ s ++ "\""
   show (Name s) = s
-  show (Lambda args body) = "(lambda (" ++ (map show args & unwords) ++ ") " ++ show body ++ ")"
+  show (Lambda args body) = "(\\" ++ (unwords args) ++ " -> " ++ show body ++ ")"
   show (CapturedLambda _) = "<captured lambda>"
   show (Quote expr) = "(quote " ++ show expr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
@@ -273,7 +277,7 @@ readBinding name =
         let lookupRes = Map.lookup name mappings
          in case (lookupRes, parent) of
               (Just value, _) -> (env, value)
-              (Nothing, Just parentEnv) -> compute parentEnv (readBinding name)
+              (Nothing, Just parentEnv) -> (env, computeRes parentEnv (readBinding name))
               (Nothing, Nothing) -> (env, ParseError ("name '" ++ name ++ "' not found"))
     )
 
@@ -281,16 +285,53 @@ readBinding name =
 defaultEnv :: Env
 defaultEnv = emptyEnv
 
-repl :: String -> [String] -> Computation String
-repl final [] = pure final
-repl str (c : cs) =
+evalManyStrings :: String -> [String] -> Computation String
+evalManyStrings final [] = pure final
+evalManyStrings str (c : cs) =
   let expr =
         c
           & Parsec.parse parseTopExpression "(source)"
           & Either.either (\err -> err & show & ParseError) id
    in do
         res <- eval expr
-        repl (str ++ "\n\n> " ++ c ++ "\n = " ++ show res) cs
+        evalManyStrings
+          ( str
+              ++ "\n\n> "
+              ++ c
+              ++ "\nparsed -> "
+              ++ show expr
+              ++ "\neval -> "
+              ++ show res
+          )
+          cs
+
+rep :: String -> Computation String
+rep input =
+  let expr =
+        input
+          & Parsec.parse parseTopExpression "(source)"
+          & Either.either (\err -> err & show & ParseError) id
+   in do
+        res <- eval expr
+        return $
+          input
+            ++ "\nparsed -> "
+            ++ show expr
+            ++ "\neval -> "
+            ++ show res
+
+repl :: Env -> IO ()
+repl env = do
+  putStr "\n> "
+  hFlush stdout
+  input <- getLine
+  if null input
+    then return ()
+    else
+      let (resEnv, res) = compute env (rep input)
+       in do
+            putStrLn res
+            repl resEnv
 
 nativeFn :: String -> (Integer -> Integer -> Integer) -> Token -> Token -> Computation Token
 nativeFn fnName fn argA argB = do
@@ -298,10 +339,7 @@ nativeFn fnName fn argA argB = do
   evalB <- eval argB
   case (evalA, evalB) of
     (EInteger x, EInteger y) -> return $ EInteger (fn x y)
-    (Name _, Name _) -> return $ Call (Name fnName) [evalA, evalB]
-    (Name _, _) -> return $ Call (Name fnName) [evalA, evalB]
-    (_, Name _) -> return $ Call (Name fnName) [evalA, evalB]
-    (_, _) -> return $ ParseError ("Built-in \"" ++ fnName ++ "\" doesn't know how to handle arguments: \"" ++ show evalA ++ "\" and \"" ++ show evalB ++ "\"")
+    (_, _) -> return $ Call (Name fnName) [evalA, evalB]
 
 eval :: Token -> Computation Token
 eval (Call (Name "+") [xExpr, yExpr]) = nativeFn "+" (+) xExpr yExpr
@@ -315,17 +353,18 @@ eval (Call (Name "eval") [expr]) = do
   case res of
     Quote quotedExpr -> eval quotedExpr
     _ -> eval res
-eval (Let bindings expression) = do
-  inChildEnv
-    ( do
-        foldM_ (\_ (name, value) -> do bind name value) () bindings
-        eval expression
-    )
+eval (Let bindings expression) =
+  inChildEnv $ do
+    foldM_ (\_ (name, value) -> do bind name value) () bindings
+    eval expression
 eval (Define name expression) = do
+  -- Currently we eagerly evaluate
   evaluatedExpression <- eval expression
   bind name evaluatedExpression
   return evaluatedExpression
-eval (Name x) = readBinding x
+eval (Name x) =
+  -- eager evaluation means we don't evaluate on lookup
+  readBinding x
 eval (Lambda args bodyExpr) = return $ CapturedLambda (evalLambda args bodyExpr)
 eval (Call callExpr argExprs) = do
   fn <- eval callExpr
@@ -339,24 +378,22 @@ eval (Call callExpr argExprs) = do
                   return (arg : acc)
               )
               []
-              argExprs
+              (argExprs & reverse)
        in args >>= fnComputation
     _ ->
       pure (ParseError ("I don't know how to call: " ++ show fn))
-eval expr = return expr
+eval (EInteger x) = return $ EInteger x
+eval (EString s) = return $ EString s
+eval expr = return $ ParseError ("Not yet implemented: " ++ show expr)
 
 evalLambda :: [String] -> Token -> [Token] -> Computation Token
 evalLambda [] body [] = do eval body
 evalLambda [] _ _ = return $ ParseError "Too many arguments"
 evalLambda _ _ [] = return $ ParseError "Not enough arguments"
-evalLambda (n : ns) body (a : as) = do
-  inChildEnv
-    ( do
-        -- we currently eagerly evaluate
-        -- evalA <- eval a
-        bind n a
-        evalLambda ns body as
-    )
+evalLambda (n : ns) body (a : as) =
+  inChildEnv $ do
+    bind n a
+    evalLambda ns body as
 
 main :: IO ()
 main =
@@ -398,16 +435,24 @@ main =
           "(square (quote x))",
           "(eval (quote (square x)))",
           "((eval (quote square)) x)",
+          "(let ((z 12)) x)",
+          "(define addToX (lambda (inc) (+ x inc)))",
+          "(addToX 3)",
+          "(define ke (lambda (mass velocity) (/ (* mass (* velocity velocity)) 2)))",
+          "(ke 2 3)",
+          "(ke (quote m) (quote v))",
           "\"done\""
         ]
 
       evaluations :: Computation String
-      evaluations = repl "Starting autoevaluation...\n" test_cases
+      evaluations = evalManyStrings "Starting autoevaluation...\n" test_cases
 
       finalRes :: String
-      finalRes = computeRes defaultEnv evaluations
+      (finalEnv, finalRes) = compute defaultEnv evaluations
    in do
         putStrLn ""
         -- putStr (concatMap (\(expr, res) -> "> " ++ expr ++ "\n\t" ++ show res ++ "\n\n") parsedExpressions)
         putStrLn finalRes
+
+        repl finalEnv
         putStrLn "done"
