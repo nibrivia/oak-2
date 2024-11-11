@@ -7,12 +7,9 @@ import Control.Applicative
 import Control.Monad (ap, foldM, foldM_, liftM)
 import qualified Data.Either as Either
 import Data.Function
-import Data.List
 import qualified Data.Map as Map
-import qualified Data.Maybe as Maybe
 import Debug.Trace
 import System.IO
-import Text.Parsec ((<?>))
 import qualified Text.Parsec as Parsec
 
 debugPipe :: (Show b) => String -> b -> b
