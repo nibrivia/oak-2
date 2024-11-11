@@ -4,7 +4,7 @@
 module Main (main) where
 
 import Control.Applicative
-import Control.Monad (ap, foldM, foldM_, liftM)
+import Control.Monad (foldM, foldM_, liftM)
 import qualified Data.Either as Either
 import Data.Function
 import qualified Data.Map as Map
