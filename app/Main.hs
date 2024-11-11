@@ -21,6 +21,7 @@ data Token
   | EBool Bool
   | Name String
   | Lambda [String] Token
+  | LazyLambda [String] Token
   | Let [(String, Token)] Token
   | CapturedLambda ([Token] -> Computation Token)
   | Quote Token
@@ -40,8 +41,10 @@ instance Show Token where
   show (EBool b) = show b
   show (Name s) = s
   show (Lambda args body) = "(\\" ++ (unwords args) ++ " -> " ++ show body ++ ")"
+  show (LazyLambda args body) = "lazy(\\" ++ (unwords args) ++ " -> " ++ show body ++ ")"
   show (CapturedLambda _) = "<captured lambda>"
   show (Quote expr) = "(quote " ++ show expr ++ ")"
+  show (IfElse cond trueExpr falseExpr) = "(if " ++ show cond ++ " " ++ show trueExpr ++ " " ++ show falseExpr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
   show (Call fn args) = "(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
   show (ParseError err) = "Error: " ++ err
@@ -207,7 +210,7 @@ parseTopExpression = do
 --------------------------------
 -- Evaluation
 
-data Env = Env (Map.Map String Token) (Maybe Env)
+data Env = Env (Map.Map String (Token, Token)) (Maybe Env)
 
 newtype Computation a = Computation (Env -> (Env, a))
 
@@ -266,8 +269,20 @@ inChildEnv comp =
 bind :: String -> Token -> Computation ()
 bind name expression =
   Computation
-    ( \(Env mappings parentEnv) ->
-        (Env (mappings & Map.insert name expression) parentEnv, ())
+    ( \env@(Env mappings parentEnv) ->
+        let value = computeRes env (eval expression)
+         in (Env (mappings & Map.insert name (expression, value)) parentEnv, ())
+    )
+
+readBindingExpression :: String -> Computation Token
+readBindingExpression name =
+  Computation
+    ( \env@(Env mappings parent) ->
+        let lookupRes = Map.lookup name mappings
+         in case (lookupRes, parent) of
+              (Just (expr, _value), _) -> (env, expr)
+              (Nothing, Just parentEnv) -> (env, computeRes parentEnv (readBindingExpression name))
+              (Nothing, Nothing) -> (env, ParseError ("name '" ++ name ++ "' not found"))
     )
 
 readBinding :: String -> Computation Token
@@ -276,7 +291,7 @@ readBinding name =
     ( \env@(Env mappings parent) ->
         let lookupRes = Map.lookup name mappings
          in case (lookupRes, parent) of
-              (Just value, _) -> (env, value)
+              (Just (_expr, value), _) -> (env, value)
               (Nothing, Just parentEnv) -> (env, computeRes parentEnv (readBinding name))
               (Nothing, Nothing) -> (env, ParseError ("name '" ++ name ++ "' not found"))
     )
@@ -300,9 +315,11 @@ rep input =
    in do
         res <- eval expr
         return $
-          "parsed: "
-            ++ show expr
-            ++ "\neval  : "
+          ""
+            -- "parsed: "
+            --   ++ show expr
+            -- ++ "\n"
+            -- ++ "eval  : "
             ++ show res
 
 repl :: Env -> IO ()
@@ -333,18 +350,20 @@ eval (Call (Name "*") [xExpr, yExpr]) = nativeFn "*" (*) xExpr yExpr
 eval (Call (Name "/") [xExpr, yExpr]) = nativeFn "/" div xExpr yExpr
 eval (Call (Name "%") [xExpr, yExpr]) = nativeFn "%" rem xExpr yExpr
 eval (Call (Name "=") [xExpr, yExpr]) = do
-  xValue <- eval xExpr
+  xValue <- eval (xExpr & debugPipe "= first arg expr")
   yValue <- eval yExpr
-  case (xValue, yValue) of
+  case (xValue & debugPipe "= first arg value", yValue) of
     (EInteger x, EInteger y) -> return $ EBool (x == y)
     (EString x, EString y) -> return $ EBool (x == y)
     (Name x, Name y) -> return $ EBool (x == y)
     (EBool x, EBool y) -> return $ EBool (x == y)
-    (_, _) -> return $ EBool False
+    (Quote (Name x), Quote (Name y)) -> return $ EBool (x == y)
+    (_, _) -> return $ ParseError $ "Don't know how to compare \"" ++ show xValue ++ "\" and \"" ++ show yValue ++ "\""
 eval (Quote expr) = return expr
+eval (Call (Name "caller") [Call callFn _]) = return callFn
 eval (Call (Name "enquote") [Name n]) = do
-    res <- readBinding n
-    return $ Quote res
+  res <- readBindingExpression n
+  return $ Quote res
 eval (Call (Name "eval") [expr]) = do
   -- we need two evals here:
   -- one to eagerly evaluate the argument, which we always do
@@ -359,26 +378,22 @@ eval (Let bindings expression) =
 eval (Define name expression) = do
   -- Currently we eagerly evaluate
   evaluatedExpression <- eval expression
-  bind name evaluatedExpression
+  bind name expression
   return evaluatedExpression
 eval (Name x) =
   -- eager evaluation means we don't evaluate on lookup
   readBinding x
+eval (IfElse condExpr trueExpr falseExpr) = do
+  condValue <- eval condExpr
+  case condValue of
+    EBool True -> eval trueExpr
+    EBool False -> eval falseExpr
+    _ -> return $ ParseError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"")
 eval (Lambda args bodyExpr) = return $ CapturedLambda (evalLambda args bodyExpr)
 eval (Call callExpr argExprs) = do
   fn <- eval callExpr
   case fn of
-    CapturedLambda fnComputation ->
-      let args :: Computation [Token]
-          args =
-            foldM
-              ( \acc argExpr -> do
-                  arg <- eval argExpr
-                  return (argExpr : acc)
-              )
-              []
-              (argExprs & reverse)
-       in args >>= fnComputation
+    CapturedLambda fnComputation -> fnComputation argExprs
     _ ->
       pure (ParseError ("I don't know how to call: " ++ show fn))
 eval (EInteger x) = return $ EInteger x
@@ -389,9 +404,9 @@ evalLambda :: [String] -> Token -> [Token] -> Computation Token
 evalLambda [] body [] = do eval body
 evalLambda [] _ _ = return $ ParseError "Too many arguments"
 evalLambda _ _ [] = return $ ParseError "Not enough arguments"
-evalLambda (n : ns) body (a : as) =
+evalLambda (n : ns) body (argExpr : as) =
   inChildEnv $ do
-    bind n a
+    bind n argExpr
     evalLambda ns body as
 
 main :: IO ()
@@ -438,13 +453,17 @@ main =
           "(define addToX (lambda (inc) (+ x inc)))",
           "(addToX 3)",
           "(define ke (lambda (mass velocity) (/ (* mass (* velocity velocity)) 2)))",
-          "(ke 2 3)",
+          "(ke (quote m) 2)",
           "(ke (quote m) (quote v))",
           "(define capture (lambda (fn) (enquote fn)))",
+          "(capture ke)",
           "(define plus (lambda (x y) (+ x y)))",
-          "(define isPlus (lambda (fn) (= (eval (enquote fn)) (quote plus))))",
+          "(define isPlus (lambda (fn) (= (enquote fn) (quote (quote plus)))))",
           "(isPlus plus)",
           "(isPlus ke)",
+          "(define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))",
+          "(fact 0)",
+          "(fact 1)",
           "\"done\""
         ]
 
