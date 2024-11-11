@@ -287,23 +287,9 @@ defaultEnv = emptyEnv
 
 evalManyStrings :: String -> [String] -> Computation String
 evalManyStrings final [] = pure final
-evalManyStrings str (c : cs) =
-  let expr =
-        c
-          & Parsec.parse parseTopExpression "(source)"
-          & Either.either (\err -> err & show & ParseError) id
-   in do
-        res <- eval expr
-        evalManyStrings
-          ( str
-              ++ "\n\n> "
-              ++ c
-              ++ "\nparsed -> "
-              ++ show expr
-              ++ "\neval -> "
-              ++ show res
-          )
-          cs
+evalManyStrings str (c : cs) = do
+  res <- rep c
+  evalManyStrings (str ++ "\n\n> " ++ c ++ "\n" ++ res) cs
 
 rep :: String -> Computation String
 rep input =
@@ -314,10 +300,9 @@ rep input =
    in do
         res <- eval expr
         return $
-          input
-            ++ "\nparsed -> "
+          "parsed: "
             ++ show expr
-            ++ "\neval -> "
+            ++ "\neval  : "
             ++ show res
 
 repl :: Env -> IO ()
@@ -349,10 +334,12 @@ eval (Call (Name "/") [xExpr, yExpr]) = nativeFn "/" div xExpr yExpr
 eval (Call (Name "%") [xExpr, yExpr]) = nativeFn "%" rem xExpr yExpr
 eval (Quote expr) = return expr
 eval (Call (Name "eval") [expr]) = do
+  -- we need two evals here:
+  -- one to evaluate the argument, which we always do
   res <- eval expr
-  case res of
-    Quote quotedExpr -> eval quotedExpr
-    _ -> eval res
+
+  -- and one to actually do the "eval"
+  eval res
 eval (Let bindings expression) =
   inChildEnv $ do
     foldM_ (\_ (name, value) -> do bind name value) () bindings
