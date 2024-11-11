@@ -21,6 +21,7 @@ debugPipe name x = trace (name ++ ": " ++ show x) x
 data Token
   = EInteger Integer
   | EString String
+  | EBool Bool
   | Name String
   | Lambda [String] Token
   | Let [(String, Token)] Token
@@ -39,6 +40,7 @@ data Expression
 instance Show Token where
   show (EInteger x) = show x
   show (EString s) = "\"" ++ s ++ "\""
+  show (EBool b) = show b
   show (Name s) = s
   show (Lambda args body) = "(\\" ++ (unwords args) ++ " -> " ++ show body ++ ")"
   show (CapturedLambda _) = "<captured lambda>"
@@ -56,6 +58,7 @@ parseName = do
       <|> Parsec.string "/"
       <|> Parsec.string "-"
       <|> Parsec.string "%"
+      <|> Parsec.string "="
       <|> parseNamestring
   return (Name name_str)
 
@@ -332,7 +335,19 @@ eval (Call (Name "-") [xExpr, yExpr]) = nativeFn "-" (-) xExpr yExpr
 eval (Call (Name "*") [xExpr, yExpr]) = nativeFn "*" (*) xExpr yExpr
 eval (Call (Name "/") [xExpr, yExpr]) = nativeFn "/" div xExpr yExpr
 eval (Call (Name "%") [xExpr, yExpr]) = nativeFn "%" rem xExpr yExpr
+eval (Call (Name "=") [xExpr, yExpr]) = do
+  xValue <- eval xExpr
+  yValue <- eval yExpr
+  case (xValue, yValue) of
+    (EInteger x, EInteger y) -> return $ EBool (x == y)
+    (EString x, EString y) -> return $ EBool (x == y)
+    (Name x, Name y) -> return $ EBool (x == y)
+    (EBool x, EBool y) -> return $ EBool (x == y)
+    (_, _) -> return $ EBool False
 eval (Quote expr) = return expr
+eval (Call (Name "enquote") [Name n]) = do
+    res <- readBinding n
+    return $ Quote res
 eval (Call (Name "eval") [expr]) = do
   -- we need two evals here:
   -- one to eagerly evaluate the argument, which we always do
@@ -362,7 +377,7 @@ eval (Call callExpr argExprs) = do
             foldM
               ( \acc argExpr -> do
                   arg <- eval argExpr
-                  return (arg : acc)
+                  return (argExpr : acc)
               )
               []
               (argExprs & reverse)
@@ -428,6 +443,11 @@ main =
           "(define ke (lambda (mass velocity) (/ (* mass (* velocity velocity)) 2)))",
           "(ke 2 3)",
           "(ke (quote m) (quote v))",
+          "(define capture (lambda (fn) (enquote fn)))",
+          "(define plus (lambda (x y) (+ x y)))",
+          "(define isPlus (lambda (fn) (= (eval (enquote fn)) (quote plus))))",
+          "(isPlus plus)",
+          "(isPlus ke)",
           "\"done\""
         ]
 
