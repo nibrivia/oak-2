@@ -335,7 +335,7 @@ eval (Call (Name "%") [xExpr, yExpr]) = nativeFn "%" rem xExpr yExpr
 eval (Quote expr) = return expr
 eval (Call (Name "eval") [expr]) = do
   -- we need two evals here:
-  -- one to evaluate the argument, which we always do
+  -- one to eagerly evaluate the argument, which we always do
   res <- eval expr
 
   -- and one to actually do the "eval"
