@@ -21,9 +21,8 @@ data Token
   | EBool Bool
   | Name String
   | Lambda [String] Token
-  | LazyLambda [String] Token
   | Let [(String, Token)] Token
-  | CapturedLambda ([Token] -> Computation Token)
+  | CapturedLambda Env ([Token] -> Computation Token)
   | Quote Token
   | IfElse Token Token Token
   | Define String Token
@@ -40,9 +39,8 @@ instance Show Token where
   show (EString s) = "\"" ++ s ++ "\""
   show (EBool b) = show b
   show (Name s) = s
-  show (Lambda args body) = "(\\" ++ (unwords args) ++ " -> " ++ show body ++ ")"
-  show (LazyLambda args body) = "lazy(\\" ++ (unwords args) ++ " -> " ++ show body ++ ")"
-  show (CapturedLambda _) = "<captured lambda>"
+  show (Lambda args body) = "(\\" ++ unwords args ++ " -> " ++ show body ++ ")"
+  show (CapturedLambda _ _) = "<captured lambda>"
   show (Quote expr) = "(quote " ++ show expr ++ ")"
   show (IfElse cond trueExpr falseExpr) = "(if " ++ show cond ++ " " ++ show trueExpr ++ " " ++ show falseExpr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
@@ -266,6 +264,14 @@ inChildEnv comp =
          in (parentEnv, computeRes childEnv comp)
     )
 
+currentEnv :: Computation Env
+currentEnv =
+  Computation (\env -> (env, env))
+
+inOtherEnv :: Env -> Computation a -> Computation a
+inOtherEnv otherEnv comp =
+  Computation (\env -> (env, computeRes otherEnv comp))
+
 bind :: String -> Token -> Computation ()
 bind name expression =
   Computation
@@ -316,10 +322,10 @@ rep input =
         res <- eval expr
         return $
           ""
-            -- "parsed: "
-            --   ++ show expr
-            -- ++ "\n"
-            -- ++ "eval  : "
+            ++ "parsed: "
+            ++ show expr
+            ++ "\n"
+            ++ "eval  : "
             ++ show res
 
 repl :: Env -> IO ()
@@ -360,7 +366,23 @@ eval (Call (Name "=") [xExpr, yExpr]) = do
     (Quote (Name x), Quote (Name y)) -> return $ EBool (x == y)
     (_, _) -> return $ ParseError $ "Don't know how to compare \"" ++ show xValue ++ "\" and \"" ++ show yValue ++ "\""
 eval (Quote expr) = return expr
-eval (Call (Name "caller") [Call callFn _]) = return callFn
+eval (Call (Name "bindIn") [nameExpr, valueExpr, body]) = do
+  nameValue <- eval nameExpr
+  case nameValue of
+    Name n ->
+      do
+        bind n valueExpr
+        eval body
+    _ -> return $ ParseError ("Error calling bind, name is " ++ show nameValue)
+eval (Call (Name "bind") [nameExpr, valueExpr]) = do
+  nameValue <- eval nameExpr
+  case nameValue of
+    Name n -> do bind n valueExpr; return valueExpr
+    _ -> return $ ParseError ("Error calling bind, name is " ++ show nameValue)
+eval (Call (Name "head") [Call callFn _]) = return callFn
+-- TODO figure out a list semantic
+eval (Call (Name "tail") [Call _ []]) = return (Name "empty")
+eval (Call (Name "tail") [Call _ (a : rgs)]) = return (Call a rgs)
 eval (Call (Name "enquote") [Name n]) = do
   res <- readBindingExpression n
   return $ Quote res
@@ -389,11 +411,13 @@ eval (IfElse condExpr trueExpr falseExpr) = do
     EBool True -> eval trueExpr
     EBool False -> eval falseExpr
     _ -> return $ ParseError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"")
-eval (Lambda args bodyExpr) = return $ CapturedLambda (evalLambda args bodyExpr)
+eval (Lambda args bodyExpr) = do
+  env <- currentEnv
+  return $ CapturedLambda env (evalLambda args bodyExpr)
 eval (Call callExpr argExprs) = do
   fn <- eval callExpr
   case fn of
-    CapturedLambda fnComputation -> fnComputation argExprs
+    CapturedLambda env fnComputation -> inOtherEnv env (fnComputation argExprs)
     _ ->
       pure (ParseError ("I don't know how to call: " ++ show fn))
 eval (EInteger x) = return $ EInteger x
@@ -464,6 +488,16 @@ main =
           "(define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))",
           "(fact 0)",
           "(fact 1)",
+          "(bind (quote boundName) 1)",
+          "boundName",
+          "(define add (lambda (a) (lambda (b) (+ b a))))",
+          "(define inc (add 1))",
+          "(inc 2)",
+          "(define defun (lambda (argName body) (lambda (argValue) (bindIn (head (eval (enquote argName))) argValue body))))",
+          "(define s (defun (num) (+ num num)))",
+          "(s 3)",
+          "((eval s) 3)",
+          "(enquote s)",
           "\"done\""
         ]
 
