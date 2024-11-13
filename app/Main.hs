@@ -3,19 +3,19 @@
 {-# HLINT ignore "Use <$>" #-}
 module Main (main) where
 
-import Parser
 import Control.Applicative
 import Control.Monad (foldM, foldM_, liftM)
+import Control.Monad.Trans.Maybe
 import qualified Data.Either as Either
 import Data.Function
 import qualified Data.Map as Map
 import Debug.Trace
+import Parser
 import System.IO
 import qualified Text.Parsec as Parsec
 
 debugPipe :: (Show b) => String -> b -> b
 debugPipe name x = trace (name ++ ": " ++ show x) x
-
 
 instance Functor Computation where
   -- fmap :: (a -> b) -> Computation a -> Computation b
@@ -34,7 +34,6 @@ instance Applicative Computation where
               (fnEnv, concreteFn) = computeFn argEnv
            in (fnEnv, concreteFn arg)
       )
-
 
 instance Monad Computation where
   -- >>= (Computation a) -> (a -> Computation b) -> (Computation b)
@@ -141,11 +140,10 @@ repl env = do
   input <- getLine
   if null input
     then return ()
-    else
+    else do
       let (resEnv, res) = compute env (rep input)
-       in do
-            putStrLn res
-            repl resEnv
+      putStrLn res
+      repl resEnv
 
 nativeFn :: String -> (Integer -> Integer -> Integer) -> Token -> Token -> Computation Token
 nativeFn fnName fn argA argB = do
@@ -223,21 +221,20 @@ eval (Lambda args bodyExpr) = do
 eval (Call callExpr argExprs) = do
   fn <- eval callExpr
   case fn of
-    CapturedLambda env fnComputation -> inOtherEnv env (fnComputation argExprs)
+    CapturedLambda env fnComputation -> inOtherEnv env (eval (fnComputation argExprs))
     _ ->
       pure (ParseError ("I don't know how to call: " ++ show fn))
 eval (EInteger x) = return $ EInteger x
 eval (EString s) = return $ EString s
 eval expr = return $ ParseError ("Not yet implemented: " ++ show expr)
 
-evalLambda :: [String] -> Token -> [Token] -> Computation Token
-evalLambda [] body [] = do eval body
-evalLambda [] _ _ = return $ ParseError "Too many arguments"
-evalLambda _ _ [] = return $ ParseError "Not enough arguments"
+evalLambda :: [String] -> Token -> [Token] -> Token
+evalLambda [] body [] = body
+evalLambda [] _ _ = ParseError "Too many arguments"
+evalLambda _ _ [] = ParseError "Not enough arguments"
 evalLambda (n : ns) body (argExpr : as) =
-  inChildEnv $ do
-    bind n argExpr
-    evalLambda ns body as
+  let newbody = Let [(n, argExpr)] body
+   in evalLambda ns newbody as
 
 main :: IO ()
 main =

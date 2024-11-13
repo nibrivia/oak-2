@@ -1,15 +1,12 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Use <$>" #-}
-module Parser (Token(..), Expression(..), Computation(..), Env(..), parseExpression, parseTopExpression) where
+module Parser (Token (..), Computation (..), Env (..), parseExpression, parseTopExpression) where
 
 import Control.Applicative
-import Control.Monad (foldM, foldM_, liftM)
-import qualified Data.Either as Either
 import Data.Function
 import qualified Data.Map as Map
 import Debug.Trace
-import System.IO
 import qualified Text.Parsec as Parsec
 
 debugPipe :: (Show b) => String -> b -> b
@@ -23,7 +20,7 @@ data Token
   | List [Token]
   | Lambda [String] Token
   | Let [(String, Token)] Token
-  | CapturedLambda Env ([Token] -> Computation Token)
+  | CapturedLambda Env ([Token] -> Token)
   | Quote Token
   | IfElse Token Token Token
   | Define String Token
@@ -31,14 +28,11 @@ data Token
   | Call Token [Token]
   | ParseError String
 
-data Expression
-  = Okay Token
-  | RuntimeError2 String
-  deriving (Show)
-
 data Env = Env (Map.Map String (Token, Token)) (Maybe Env)
 
 newtype Computation a = Computation (Env -> (Env, a))
+
+
 
 instance Show Token where
   show (EInteger x) = show x
@@ -47,7 +41,7 @@ instance Show Token where
   show (Name s) = s
   show (List elems) = "(list " ++ (elems & map show & unwords) ++ ")"
   show (Lambda args body) = "(\\" ++ unwords args ++ " -> " ++ show body ++ ")"
-  show (CapturedLambda _ _) = "<captured lambda>"
+  -- show (CapturedLambda _ _) = "<captured lambda>"
   show (Quote expr) = "(quote " ++ show expr ++ ")"
   show (IfElse cond trueExpr falseExpr) = "(if " ++ show cond ++ " " ++ show trueExpr ++ " " ++ show falseExpr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
@@ -211,4 +205,3 @@ parseTopExpression = do
   expr <- parseExpression
   Parsec.eof
   return expr
-
