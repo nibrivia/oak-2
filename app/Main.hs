@@ -20,6 +20,7 @@ data Token
   | EString String
   | EBool Bool
   | Name String
+  | List [Token]
   | Lambda [String] Token
   | Let [(String, Token)] Token
   | CapturedLambda Env ([Token] -> Computation Token)
@@ -33,12 +34,14 @@ data Token
 data Expression
   = Okay Token
   | RuntimeError2 String
+  deriving (Show)
 
 instance Show Token where
   show (EInteger x) = show x
   show (EString s) = "\"" ++ s ++ "\""
   show (EBool b) = show b
   show (Name s) = s
+  show (List elems) = "(list " ++ (elems & map show & unwords) ++ ")"
   show (Lambda args body) = "(\\" ++ unwords args ++ " -> " ++ show body ++ ")"
   show (CapturedLambda _ _) = "<captured lambda>"
   show (Quote expr) = "(quote " ++ show expr ++ ")"
