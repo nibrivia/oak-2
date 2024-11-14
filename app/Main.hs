@@ -69,9 +69,7 @@ runInEnv :: Env -> Computation a -> Computation a
 runInEnv env comp = do
   cur_env <- getEnv
   setEnv env
-  res <- comp
-  setEnv cur_env
-  return res
+  finallyE (comp) (setEnv cur_env)
 
 emptyEnv :: Env
 emptyEnv = Env Map.empty Nothing
