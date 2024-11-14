@@ -26,10 +26,11 @@ data Expression
   | Define String Expression
   | DefineType String Expression
   | Call Expression [Expression]
+  deriving (Eq)
 
 -- deriving (Show)
 
-data Env = Env (Map.Map String (Expression, Expression)) (Maybe Env) deriving (Show)
+data Env = Env (Map.Map String (Expression, Expression)) (Maybe Env) deriving (Show, Eq)
 
 instance Show Expression where
   show (EInteger x) = show x

@@ -56,12 +56,15 @@ setEnv = lift . lift . put
 
 withTrace :: String -> Computation a -> Computation a
 withTrace str comp = do
-  cur_stack <- lift ask
+  cur_stack <- curStack
   mapExceptT (local (const (cur_stack ++ [str]))) comp
+
+curStack :: Computation [String]
+curStack = lift ask
 
 throwWithTrace :: ErrorType -> String -> Computation a
 throwWithTrace errType msg = do
-  cur_stack <- lift ask
+  cur_stack <- curStack
   let new_err = Error {errorType = errType, message = msg, stack = cur_stack}
   throwE new_err
 
@@ -69,7 +72,7 @@ runInEnv :: Env -> Computation a -> Computation a
 runInEnv env comp = do
   cur_env <- getEnv
   setEnv env
-  finallyE (comp) (setEnv cur_env)
+  finallyE comp (setEnv cur_env) -- we must always got back to our initial env
 
 emptyEnv :: Env
 emptyEnv = Env Map.empty Nothing
@@ -82,6 +85,7 @@ runInChildEnv comp = do
 
 bind :: String -> Expression -> Computation ()
 bind name expression =
+  -- ADD LAZINESS
   withTrace ("bind " ++ name ++ " = " ++ show expression) $ do
     (Env mappings parentEnv) <- getEnv
     value <- traceEval expression
@@ -90,7 +94,7 @@ bind name expression =
 
 readBindingExpression :: String -> Computation Expression
 readBindingExpression name = do
-  (Env mappings parent) <- getEnv
+  env@(Env mappings parent) <- getEnv
   let lookupRes = Map.lookup name mappings
   case (lookupRes, parent) of
     (Just (expr, _value), _) ->
@@ -98,11 +102,11 @@ readBindingExpression name = do
     (Nothing, Just parentEnv) ->
       runInEnv parentEnv (readBindingExpression name)
     (Nothing, Nothing) ->
-      throwWithTrace RuntimeError ("name '" ++ name ++ "' not found")
+      throwWithTrace RuntimeError ("name '" ++ name ++ "' not found. Env\n: " ++ show env)
 
 readBinding :: String -> Computation Expression
 readBinding name = do
-  (Env mappings parent) <- getEnv
+  env@(Env mappings parent) <- getEnv
   let lookupRes = Map.lookup name mappings
   case (lookupRes, parent) of
     (Just (_expr, value), _) ->
@@ -110,7 +114,7 @@ readBinding name = do
     (Nothing, Just parentEnv) ->
       runInEnv parentEnv (readBinding name)
     (Nothing, Nothing) ->
-      throwWithTrace RuntimeError ("name '" ++ name ++ "' not found")
+      throwWithTrace RuntimeError ("name '" ++ name ++ "' not found. Env\n: " ++ show env)
 
 -- | The default environment is not the empty environment!
 defaultEnv :: Env
@@ -125,7 +129,9 @@ nativeFn fnName fn argA argB = do
     (_, _) -> return $ Call (Name fnName) [evalA, evalB]
 
 traceEval :: Expression -> Computation Expression
-traceEval expr = withTrace (show expr) $ eval expr
+traceEval expr = do
+  s <- curStack
+  withTrace (show expr) $ eval (expr & debugPipe ("\ntrace:\n" ++ (s & reverse & map ("  . " ++) & unlines) ++ "expr"))
 
 eval :: Expression -> Computation Expression
 eval (Call (Name "+") [xExpr, yExpr]) = nativeFn "+" (+) xExpr yExpr
@@ -170,7 +176,7 @@ eval (Call (Name "tail") [argExpr]) = do
   traceEval $ Call (Name "tail") [argValue]
 eval (Call (Name "enquote") [Name n]) = do
   res <- readBindingExpression n
-  return $ Quote res
+  return res
 eval (Call (Name "eval") [expr]) = do
   -- we need two evals here:
   -- one to eagerly evaluate the argument, which we always do
@@ -204,6 +210,8 @@ eval (Call callExpr argExprs) = do
   case fn of
     CapturedLambda env argNames body ->
       evalLambda argNames argExprs env body
+    Name s ->
+      eval (Call fn argExprs)
     _ ->
       throwWithTrace RuntimeError ("I don't know how to call: " ++ show fn)
 eval expr@(EInteger _) = return expr
@@ -216,6 +224,7 @@ evalLambda [] [] env body = runInEnv env $ traceEval body
 evalLambda [] _ _ _ = throwWithTrace RuntimeError "Too many arguments"
 evalLambda _ [] _ _ = throwWithTrace RuntimeError "Not enough arguments"
 evalLambda (n : ns) (argExpr : as) env body =
+  -- TODO arg needs to be evaluated in current env
   let newbody = Let [(n, argExpr)] body
    in evalLambda ns as env newbody
 
@@ -267,9 +276,9 @@ main =
   let test_cases =
         [ "2",
           "(+ 2 1)",
-          "(define name \"olivia\")",
-          "name",
-          "(define x 5)",
+          -- "(define name \"olivia\")",
+          -- "name",
+          -- "(define x 5)",
           -- "x",
           -- "(quote x)",
           -- "(eval (quote x))",
@@ -283,7 +292,7 @@ main =
           -- "(lambda (arg) (* arg arg))",
           -- "((lambda (arg) (* arg arg)) 5)",
           -- "arg",
-          "(define square (lambda (arg) (* arg arg)))",
+          -- "(define square (lambda (arg) (* arg arg)))",
           -- "(square (quote x))",
           -- "square",
           -- "(square)",
@@ -312,11 +321,11 @@ main =
           -- "(ke (quote m) (quote v))",
           -- "(define capture (lambda (fn) (enquote fn)))",
           -- "(capture ke)",
-          "(define plus (lambda (x y) (+ x y)))",
-          "(plus 2 3)",
-          "(define isPlus (lambda (fn) (= (enquote fn) (quote (quote plus)))))",
-          "(isPlus plus)",
-          "(isPlus ke)",
+          -- "(define plus (lambda (x y) (+ x y)))",
+          -- "(plus 2 3)",
+          -- "(define isPlus (lambda (fn) (= (enquote fn) (quote (quote plus)))))",
+          -- "(isPlus plus)",
+          -- "(isPlus ke)",
           -- "(define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))",
           -- "(fact 0)",
           -- "(fact 1)",
@@ -329,11 +338,15 @@ main =
           -- "(head xs)",
           -- "(tail xs)",
           -- "(define defun (lambda (fnName argName body) (bind fnName (quote (lambda (argValue) (bindIn argName argValue (eval body)))))))",
-          "(defun (quote s) (quote num) (quote (+ num 97)))",
+          -- "(defun (quote s) (quote num) (quote (+ num 97)))",
           "(bind (quote v) 3)",
           "v",
-          "(define myBind (lambda (name value) (bind name value)))",
-          "(myBind (quote t 5)",
+          "(define myBind (lambda (name value) ((quote bind) (enquote name) value)))",
+          "(eval ((quote bind) (quote t) 5))",
+          "(myBind u 5)",
+          "u",
+          -- "(define tBind (myBind (quote t) 5))",
+          -- "(eval (eval tBind))",
           "t",
           -- "(bind (quote s) square)",
           -- "(define s square)",
