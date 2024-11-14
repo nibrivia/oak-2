@@ -28,7 +28,7 @@ data Error = Error
 
 instance Show Error where
   show (Error eType msg sTrace) =
-    show eType ++ ": " ++ msg ++ " in:\n" ++ (sTrace & map ("    " ++) & reverse & unlines)
+    show eType ++ ": " ++ msg ++ " in:\n" ++ (sTrace & map (" > " ++) & reverse & unlines)
 
 debugPipe :: (Show b) => String -> b -> b
 debugPipe name x = trace (name ++ ": " ++ show x) x
@@ -81,11 +81,12 @@ runInChildEnv comp = do
   runInEnv childEnv comp
 
 bind :: String -> Token -> Computation ()
-bind name expression = do
-  (Env mappings parentEnv) <- getEnv
-  value <- eval expression
-  let newEnv = mappings & Map.insert name (expression, value)
-  setEnv (Env newEnv parentEnv)
+bind name expression =
+  withTrace ("bind " ++ name ++ " = " ++ show expression) $ do
+    (Env mappings parentEnv) <- getEnv
+    value <- traceEval expression
+    let newEnv = mappings & Map.insert name (expression, value)
+    setEnv (Env newEnv parentEnv)
 
 readBindingExpression :: String -> Computation Token
 readBindingExpression name = do
@@ -117,8 +118,8 @@ defaultEnv = emptyEnv
 
 nativeFn :: String -> (Integer -> Integer -> Integer) -> Token -> Token -> Computation Token
 nativeFn fnName fn argA argB = do
-  evalA <- eval argA
-  evalB <- eval argB
+  evalA <- traceEval argA
+  evalB <- traceEval argB
   case (evalA, evalB) of
     (EInteger x, EInteger y) -> return $ EInteger (fn x y)
     (_, _) -> return $ Call (Name fnName) [evalA, evalB]
@@ -147,19 +148,26 @@ eval (Call (Name "bindIn") [nameExpr, valueExpr, body]) = do
   nameValue <- traceEval nameExpr
   case nameValue of
     Name n ->
-      do
+      runInChildEnv $ do
         bind n valueExpr
         traceEval body
     _ -> do throwWithTrace RuntimeError ("Error calling bind, name is " ++ show nameValue)
 eval (Call (Name "bind") [nameExpr, valueExpr]) = do
   nameValue <- traceEval nameExpr
+  valueVal <- traceEval valueExpr
   case nameValue of
-    Name n -> do bind n valueExpr; return valueExpr
+    Name n -> do bind n valueVal; return valueExpr
     _ -> do throwWithTrace RuntimeError ("Error calling bind, name is " ++ show nameValue)
-eval (Call (Name "head") [Call callFn _]) = return callFn
+eval (Call (Name "head") [List (x : _)]) = return x
+eval (Call (Name "head") [argExpr]) = do
+  argValue <- traceEval argExpr
+  traceEval $ Call (Name "head") [argValue]
 -- TODO figure out a list semantic
-eval (Call (Name "tail") [Call _ []]) = return (Name "empty")
-eval (Call (Name "tail") [Call _ (a : rgs)]) = return (Call a rgs)
+eval (Call (Name "tail") [List (_ : [])]) = return (Name "empty")
+eval (Call (Name "tail") [List (a : rgs)]) = return (List rgs)
+eval (Call (Name "tail") [argExpr]) = do
+  argValue <- traceEval argExpr
+  traceEval $ Call (Name "tail") [argValue]
 eval (Call (Name "enquote") [Name n]) = do
   res <- readBindingExpression n
   return $ Quote res
@@ -198,8 +206,9 @@ eval (Call callExpr argExprs) = do
       evalLambda argNames argExprs env body
     _ ->
       throwWithTrace RuntimeError ("I don't know how to call: " ++ show fn)
-eval (EInteger x) = return $ EInteger x
-eval (EString s) = return $ EString s
+eval expr@(EInteger _) = return expr
+eval expr@(EString _) = return expr
+eval expr@(List _) = return expr
 eval expr = throwWithTrace RuntimeError ("Not yet implemented: " ++ show expr)
 
 evalLambda :: [String] -> [Token] -> Env -> Token -> Computation Token
@@ -261,65 +270,76 @@ main =
           "(define name \"olivia\")",
           "name",
           "(define x 5)",
-          "x",
-          "(quote x)",
-          "(eval (quote x))",
-          "(+ x 1)",
-          "(define y (+ x 2))",
-          "(+ x y)",
-          "(+ x (* y 3))",
-          "(let ((a 1)) a)",
-          "(let ((z 12)) (/ z 4))",
-          "z",
-          "(lambda (arg) (* arg arg))",
-          "((lambda (arg) (* arg arg)) 5)",
-          "arg",
+          -- "x",
+          -- "(quote x)",
+          -- "(eval (quote x))",
+          -- "(+ x 1)",
+          -- "(define y (+ x 2))",
+          -- "(+ x y)",
+          -- "(+ x (* y 3))",
+          -- "(let ((a 1)) a)",
+          -- "(let ((z 12)) (/ z 4))",
+          -- "z",
+          -- "(lambda (arg) (* arg arg))",
+          -- "((lambda (arg) (* arg arg)) 5)",
+          -- "arg",
           "(define square (lambda (arg) (* arg arg)))",
-          "(square (quote x))",
-          "square",
-          "(square)",
-          "(square x y)",
-          "(square x)",
-          "(square z)",
-          "(square x)",
-          "(define mass (quote m))",
-          "mass",
-          "m",
-          "(eval mass)",
-          "(define m 88)",
-          "mass",
-          "(eval mass)",
-          "(quote (square x))",
-          "(* (quote height) (quote mass))",
-          "(* x (quote mass))",
-          "(square (quote x))",
-          "(eval (quote (square x)))",
-          "((eval (quote square)) x)",
-          "(let ((z 12)) x)",
-          "(define addToX (lambda (inc) (+ x inc)))",
-          "(addToX 3)",
-          "(define ke (lambda (mass velocity) (/ (* mass (* velocity velocity)) 2)))",
-          "(ke (quote m) 2)",
-          "(ke (quote m) (quote v))",
-          "(define capture (lambda (fn) (enquote fn)))",
-          "(capture ke)",
+          -- "(square (quote x))",
+          -- "square",
+          -- "(square)",
+          -- "(square x y)",
+          -- "(square x)",
+          -- "(square z)",
+          -- "(square x)",
+          -- "(define mass (quote m))",
+          -- "mass",
+          -- "m",
+          -- "(eval mass)",
+          -- "(define m 88)",
+          -- "mass",
+          -- "(eval mass)",
+          -- "(quote (square x))",
+          -- "(* (quote height) (quote mass))",
+          -- "(* x (quote mass))",
+          -- "(square (quote x))",
+          -- "(eval (quote (square x)))",
+          -- "((eval (quote square)) x)",
+          -- "(let ((z 12)) x)",
+          -- "(define addToX (lambda (inc) (+ x inc)))",
+          -- "(addToX 3)",
+          -- "(define ke (lambda (mass velocity) (/ (* mass (* velocity velocity)) 2)))",
+          -- "(ke (quote m) 2)",
+          -- "(ke (quote m) (quote v))",
+          -- "(define capture (lambda (fn) (enquote fn)))",
+          -- "(capture ke)",
           "(define plus (lambda (x y) (+ x y)))",
+          "(plus 2 3)",
           "(define isPlus (lambda (fn) (= (enquote fn) (quote (quote plus)))))",
           "(isPlus plus)",
           "(isPlus ke)",
-          "(define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))",
-          "(fact 0)",
-          "(fact 1)",
-          "(bind (quote boundName) 1)",
-          "boundName",
-          "(define add (lambda (a) (lambda (b) (+ b a))))",
-          "(define inc (add 1))",
-          "(inc 2)",
-          "(define defun (lambda (argName body) (lambda (argValue) (bindIn (head (eval (enquote argName))) argValue (enquote body)))))",
-          "(define s (defun (quote num) (+ num 97)))",
-          "(s 3)",
-          "((eval s) 3)",
-          "(enquote s)",
+          -- "(define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))",
+          -- "(fact 0)",
+          -- "(fact 1)",
+          -- "(bind (quote boundName) 1)",
+          -- "boundName",
+          -- "(define add (lambda (a) (lambda (b) (+ b a))))",
+          -- "(define inc (add 1))",
+          -- "(inc 2)",
+          -- "(define xs (list 1 2 3))",
+          -- "(head xs)",
+          -- "(tail xs)",
+          -- "(define defun (lambda (fnName argName body) (bind fnName (quote (lambda (argValue) (bindIn argName argValue (eval body)))))))",
+          "(defun (quote s) (quote num) (quote (+ num 97)))",
+          "(bind (quote v) 3)",
+          "v",
+          "(define myBind (lambda (name value) (bind name value)))",
+          "(myBind (quote t) 5)",
+          "t",
+          -- "(bind (quote s) square)",
+          -- "(define s square)",
+          -- "(s 3)",
+          -- "((eval s) 3)",
+          -- "(enquote s)",
           "\"done\""
         ]
 

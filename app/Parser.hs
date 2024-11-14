@@ -27,7 +27,9 @@ data Token
   | DefineType String Token
   | Call Token [Token]
 
-data Env = Env (Map.Map String (Token, Token)) (Maybe Env)
+-- deriving (Show)
+
+data Env = Env (Map.Map String (Token, Token)) (Maybe Env) deriving (Show)
 
 instance Show Token where
   show (EInteger x) = show x
@@ -36,12 +38,13 @@ instance Show Token where
   show (Name s) = s
   show (List elems) = "(list " ++ (elems & map show & unwords) ++ ")"
   show (Lambda args body) = "(\\" ++ unwords args ++ " -> " ++ show body ++ ")"
+  show (Let argValues body) = "(let\n    " ++ (argValues & map (\(n, v) -> "  (" ++ n ++ " = " ++ show v ++ ")") & unwords) ++ "\n     " ++ show body ++ ")"
   -- show (CapturedLambda _ _) = "<captured lambda>"
   show (Quote expr) = "(quote " ++ show expr ++ ")"
   show (IfElse cond trueExpr falseExpr) = "(if " ++ show cond ++ " " ++ show trueExpr ++ " " ++ show falseExpr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
   show (Call fn args) = "(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
-  show (CapturedLambda _ _ _) = "<captured lambda>"
+  show (CapturedLambda env argNames body) = "<Captured Lambda: " ++ show (Lambda argNames body) ++ " in env:\n  " ++ show env ++ "\n  >"
   show _ = "(don't know how to display this expression)"
 
 parseName :: Parsec.Parsec String () Token
@@ -85,6 +88,19 @@ parseCall =
             parseExpression
         )
     return (Call name arguments)
+
+parseList :: Parsec.Parsec String () Token
+parseList =
+  inParens $
+    do
+      parseKeyword "list"
+      elems <-
+        Parsec.many
+          ( do
+              separator
+              parseExpression
+          )
+      return (List elems)
 
 parseLambda :: Parsec.Parsec String () Token
 parseLambda = do
@@ -193,6 +209,7 @@ parseExpression =
     <|> Parsec.try parseDefineType
     <|> Parsec.try parseQuote
     <|> Parsec.try parseIfElse
+    <|> Parsec.try parseList
     <|> parseCall
 
 parseTopExpression :: Parsec.Parsec String () Token
