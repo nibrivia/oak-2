@@ -59,10 +59,10 @@ withTrace str comp = do
   cur_stack <- lift ask
   mapExceptT (local (const (cur_stack ++ [str]))) comp
 
-throwWithTrace :: Error -> Computation a
-throwWithTrace err = do
+throwWithTrace :: ErrorType -> String -> Computation a
+throwWithTrace errType msg = do
   cur_stack <- lift ask
-  let new_err = err {stack = cur_stack}
+  let new_err = Error {errorType = errType, message = msg, stack = cur_stack}
   throwE new_err
 
 runInEnv :: Env -> Computation a -> Computation a
@@ -92,20 +92,24 @@ readBindingExpression name = do
   (Env mappings parent) <- getEnv
   let lookupRes = Map.lookup name mappings
   case (lookupRes, parent) of
-    (Just (expr, _value), _) -> return expr
-    (Nothing, Just parentEnv) -> do
+    (Just (expr, _value), _) ->
+      return expr
+    (Nothing, Just parentEnv) ->
       runInEnv parentEnv (readBindingExpression name)
-    (Nothing, Nothing) -> throwWithTrace $ Error {errorType = RuntimeError, message = "name '" ++ name ++ "' not found", stack = []}
+    (Nothing, Nothing) ->
+      throwWithTrace RuntimeError ("name '" ++ name ++ "' not found")
 
 readBinding :: String -> Computation Token
 readBinding name = do
   (Env mappings parent) <- getEnv
   let lookupRes = Map.lookup name mappings
   case (lookupRes, parent) of
-    (Just (_expr, value), _) -> return value
-    (Nothing, Just parentEnv) -> do
+    (Just (_expr, value), _) ->
+      return value
+    (Nothing, Just parentEnv) ->
       runInEnv parentEnv (readBinding name)
-    (Nothing, Nothing) -> throwWithTrace $ Error RuntimeError ("name '" ++ name ++ "' not found") []
+    (Nothing, Nothing) ->
+      throwWithTrace RuntimeError ("name '" ++ name ++ "' not found")
 
 -- | The default environment is not the empty environment!
 defaultEnv :: Env
@@ -137,7 +141,7 @@ eval (Call (Name "=") [xExpr, yExpr]) = do
     (Name x, Name y) -> return $ EBool (x == y)
     (EBool x, EBool y) -> return $ EBool (x == y)
     (Quote (Name x), Quote (Name y)) -> return $ EBool (x == y)
-    (_, _) -> do throwWithTrace $ Error RuntimeError ("Don't know how to compare \"" ++ show xValue ++ "\" and \"" ++ show yValue ++ "\"") []
+    (_, _) -> do throwWithTrace RuntimeError ("Don't know how to compare \"" ++ show xValue ++ "\" and \"" ++ show yValue ++ "\"")
 eval (Quote expr) = return expr
 eval (Call (Name "bindIn") [nameExpr, valueExpr, body]) = do
   nameValue <- traceEval nameExpr
@@ -146,12 +150,12 @@ eval (Call (Name "bindIn") [nameExpr, valueExpr, body]) = do
       do
         bind n valueExpr
         traceEval body
-    _ -> do throwWithTrace $ Error RuntimeError ("Error calling bind, name is " ++ show nameValue) []
+    _ -> do throwWithTrace RuntimeError ("Error calling bind, name is " ++ show nameValue)
 eval (Call (Name "bind") [nameExpr, valueExpr]) = do
   nameValue <- traceEval nameExpr
   case nameValue of
     Name n -> do bind n valueExpr; return valueExpr
-    _ -> do throwWithTrace $ Error RuntimeError ("Error calling bind, name is " ++ show nameValue) []
+    _ -> do throwWithTrace RuntimeError ("Error calling bind, name is " ++ show nameValue)
 eval (Call (Name "head") [Call callFn _]) = return callFn
 -- TODO figure out a list semantic
 eval (Call (Name "tail") [Call _ []]) = return (Name "empty")
@@ -183,7 +187,7 @@ eval (IfElse condExpr trueExpr falseExpr) = do
   case condValue of
     EBool True -> traceEval trueExpr
     EBool False -> traceEval falseExpr
-    _ -> throwWithTrace $ Error RuntimeError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"") []
+    _ -> throwWithTrace RuntimeError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"")
 eval (Lambda argNames bodyExpr) = do
   env <- getEnv
   return $ CapturedLambda env argNames bodyExpr
@@ -193,15 +197,15 @@ eval (Call callExpr argExprs) = do
     CapturedLambda env argNames body ->
       evalLambda argNames argExprs env body
     _ ->
-      throwWithTrace $ Error RuntimeError ("I don't know how to call: " ++ show fn) []
+      throwWithTrace RuntimeError ("I don't know how to call: " ++ show fn)
 eval (EInteger x) = return $ EInteger x
 eval (EString s) = return $ EString s
-eval expr = throwWithTrace $ Error RuntimeError ("Not yet implemented: " ++ show expr) []
+eval expr = throwWithTrace RuntimeError ("Not yet implemented: " ++ show expr)
 
 evalLambda :: [String] -> [Token] -> Env -> Token -> Computation Token
 evalLambda [] [] env body = runInEnv env $ traceEval body
-evalLambda [] _ _ _ = throwWithTrace $ Error RuntimeError "Too many arguments" []
-evalLambda _ [] _ _ = throwWithTrace $ Error RuntimeError "Not enough arguments" []
+evalLambda [] _ _ _ = throwWithTrace RuntimeError "Too many arguments"
+evalLambda _ [] _ _ = throwWithTrace RuntimeError "Not enough arguments"
 evalLambda (n : ns) (argExpr : as) env body =
   let newbody = Let [(n, argExpr)] body
    in evalLambda ns as env newbody
