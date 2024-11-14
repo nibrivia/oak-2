@@ -1,7 +1,7 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Use <$>" #-}
-module Parser (Token (..), Env (..), parseExpression, parseTopExpression) where
+module Parser (Expression (..), Env (..), parseExpression, parseTopExpression) where
 
 import Control.Applicative
 import Data.Function
@@ -12,26 +12,26 @@ import qualified Text.Parsec as Parsec
 debugPipe :: (Show b) => String -> b -> b
 debugPipe name x = trace (name ++ ": " ++ show x) x
 
-data Token
+data Expression
   = EInteger Integer
   | EString String
   | EBool Bool
   | Name String
-  | List [Token]
-  | Lambda [String] Token
-  | Let [(String, Token)] Token
-  | CapturedLambda Env [String] Token
-  | Quote Token
-  | IfElse Token Token Token
-  | Define String Token
-  | DefineType String Token
-  | Call Token [Token]
+  | List [Expression]
+  | Lambda [String] Expression
+  | Let [(String, Expression)] Expression
+  | CapturedLambda Env [String] Expression
+  | Quote Expression
+  | IfElse Expression Expression Expression
+  | Define String Expression
+  | DefineType String Expression
+  | Call Expression [Expression]
 
 -- deriving (Show)
 
-data Env = Env (Map.Map String (Token, Token)) (Maybe Env) deriving (Show)
+data Env = Env (Map.Map String (Expression, Expression)) (Maybe Env) deriving (Show)
 
-instance Show Token where
+instance Show Expression where
   show (EInteger x) = show x
   show (EString s) = "\"" ++ s ++ "\""
   show (EBool b) = show b
@@ -47,7 +47,7 @@ instance Show Token where
   show (CapturedLambda env argNames body) = "<Captured Lambda: " ++ show (Lambda argNames body) ++ " in env:\n  " ++ show env ++ "\n  >"
   show _ = "(don't know how to display this expression)"
 
-parseName :: Parsec.Parsec String () Token
+parseName :: Parsec.Parsec String () Expression
 parseName = do
   name_str <-
     Parsec.string "+"
@@ -59,13 +59,13 @@ parseName = do
       <|> parseNamestring
   return (Name name_str)
 
-parseString :: Parsec.Parsec String () Token
+parseString :: Parsec.Parsec String () Expression
 parseString = do
   _ <- Parsec.char '"'
   str <- Parsec.manyTill Parsec.anyChar (Parsec.char '"')
   return (EString str)
 
-parseInt :: Parsec.Parsec String () Token
+parseInt :: Parsec.Parsec String () Expression
 parseInt = do
   integer_str <- Parsec.many1 Parsec.digit
   return (EInteger (read integer_str))
@@ -77,7 +77,7 @@ inParens parser = do
   closeCall
   return res
 
-parseCall :: Parsec.Parsec String () Token
+parseCall :: Parsec.Parsec String () Expression
 parseCall =
   inParens $ do
     name <- parseExpression
@@ -89,7 +89,7 @@ parseCall =
         )
     return (Call name arguments)
 
-parseList :: Parsec.Parsec String () Token
+parseList :: Parsec.Parsec String () Expression
 parseList =
   inParens $
     do
@@ -102,7 +102,7 @@ parseList =
           )
       return (List elems)
 
-parseLambda :: Parsec.Parsec String () Token
+parseLambda :: Parsec.Parsec String () Expression
 parseLambda = do
   inParens $
     do
@@ -113,7 +113,7 @@ parseLambda = do
       separator
       Lambda args <$> parseExpression
 
-parseTuple :: Parsec.Parsec String () (String, Token)
+parseTuple :: Parsec.Parsec String () (String, Expression)
 parseTuple =
   inParens $ do
     name <- parseNamestring
@@ -121,7 +121,7 @@ parseTuple =
     value <- parseExpression
     return (name, value)
 
-parseLet :: Parsec.Parsec String () Token
+parseLet :: Parsec.Parsec String () Expression
 parseLet = do
   inParens $ do
     parseKeyword "let"
@@ -158,7 +158,7 @@ separator = do
   _ <- Parsec.many1 Parsec.space
   return ()
 
-parseDefineType :: Parsec.Parsec String () Token
+parseDefineType :: Parsec.Parsec String () Expression
 parseDefineType =
   inParens $ do
     parseKeyword "defineType"
@@ -168,7 +168,7 @@ parseDefineType =
     value <- parseExpression
     return (DefineType name value)
 
-parseIfElse :: Parsec.Parsec String () Token
+parseIfElse :: Parsec.Parsec String () Expression
 parseIfElse =
   inParens $ do
     parseKeyword "if"
@@ -180,7 +180,7 @@ parseIfElse =
     falseExpr <- parseExpression
     return (IfElse condExpr trueExpr falseExpr)
 
-parseDefine :: Parsec.Parsec String () Token
+parseDefine :: Parsec.Parsec String () Expression
 parseDefine =
   inParens $ do
     parseKeyword "define"
@@ -190,7 +190,7 @@ parseDefine =
     value <- parseExpression
     return (Define name value)
 
-parseQuote :: Parsec.Parsec String () Token
+parseQuote :: Parsec.Parsec String () Expression
 parseQuote = do
   inParens $ do
     _ <- Parsec.string "quote"
@@ -198,7 +198,7 @@ parseQuote = do
     expression <- parseExpression
     return (Quote expression)
 
-parseExpression :: Parsec.Parsec String () Token
+parseExpression :: Parsec.Parsec String () Expression
 parseExpression =
   parseInt
     <|> parseString
@@ -212,7 +212,7 @@ parseExpression =
     <|> Parsec.try parseList
     <|> parseCall
 
-parseTopExpression :: Parsec.Parsec String () Token
+parseTopExpression :: Parsec.Parsec String () Expression
 parseTopExpression = do
   expr <- parseExpression
   Parsec.eof

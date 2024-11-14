@@ -80,7 +80,7 @@ runInChildEnv comp = do
   let childEnv = makeChildEnv env
   runInEnv childEnv comp
 
-bind :: String -> Token -> Computation ()
+bind :: String -> Expression -> Computation ()
 bind name expression =
   withTrace ("bind " ++ name ++ " = " ++ show expression) $ do
     (Env mappings parentEnv) <- getEnv
@@ -88,7 +88,7 @@ bind name expression =
     let newEnv = mappings & Map.insert name (expression, value)
     setEnv (Env newEnv parentEnv)
 
-readBindingExpression :: String -> Computation Token
+readBindingExpression :: String -> Computation Expression
 readBindingExpression name = do
   (Env mappings parent) <- getEnv
   let lookupRes = Map.lookup name mappings
@@ -100,7 +100,7 @@ readBindingExpression name = do
     (Nothing, Nothing) ->
       throwWithTrace RuntimeError ("name '" ++ name ++ "' not found")
 
-readBinding :: String -> Computation Token
+readBinding :: String -> Computation Expression
 readBinding name = do
   (Env mappings parent) <- getEnv
   let lookupRes = Map.lookup name mappings
@@ -116,7 +116,7 @@ readBinding name = do
 defaultEnv :: Env
 defaultEnv = emptyEnv
 
-nativeFn :: String -> (Integer -> Integer -> Integer) -> Token -> Token -> Computation Token
+nativeFn :: String -> (Integer -> Integer -> Integer) -> Expression -> Expression -> Computation Expression
 nativeFn fnName fn argA argB = do
   evalA <- traceEval argA
   evalB <- traceEval argB
@@ -124,10 +124,10 @@ nativeFn fnName fn argA argB = do
     (EInteger x, EInteger y) -> return $ EInteger (fn x y)
     (_, _) -> return $ Call (Name fnName) [evalA, evalB]
 
-traceEval :: Token -> Computation Token
+traceEval :: Expression -> Computation Expression
 traceEval expr = withTrace (show expr) $ eval expr
 
-eval :: Token -> Computation Token
+eval :: Expression -> Computation Expression
 eval (Call (Name "+") [xExpr, yExpr]) = nativeFn "+" (+) xExpr yExpr
 eval (Call (Name "-") [xExpr, yExpr]) = nativeFn "-" (-) xExpr yExpr
 eval (Call (Name "*") [xExpr, yExpr]) = nativeFn "*" (*) xExpr yExpr
@@ -211,7 +211,7 @@ eval expr@(EString _) = return expr
 eval expr@(List _) = return expr
 eval expr = throwWithTrace RuntimeError ("Not yet implemented: " ++ show expr)
 
-evalLambda :: [String] -> [Token] -> Env -> Token -> Computation Token
+evalLambda :: [String] -> [Expression] -> Env -> Expression -> Computation Expression
 evalLambda [] [] env body = runInEnv env $ traceEval body
 evalLambda [] _ _ _ = throwWithTrace RuntimeError "Too many arguments"
 evalLambda _ [] _ _ = throwWithTrace RuntimeError "Not enough arguments"
@@ -333,7 +333,7 @@ main =
           "(bind (quote v) 3)",
           "v",
           "(define myBind (lambda (name value) (bind name value)))",
-          "(myBind (quote t) 5)",
+          "(myBind (quote t 5)",
           "t",
           -- "(bind (quote s) square)",
           -- "(define s square)",
