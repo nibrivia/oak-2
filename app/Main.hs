@@ -1,10 +1,13 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Use <$>" #-}
+{-# HLINT ignore "Use tuple-section" #-}
 module Main (main) where
 
 import Control.Applicative
 import Control.Monad (foldM, foldM_, liftM)
+import Control.Monad.Trans.Except
+import Control.Monad.Trans.Identity
 import Control.Monad.Trans.Maybe
 import qualified Data.Either as Either
 import Data.Function
@@ -17,17 +20,26 @@ import qualified Text.Parsec as Parsec
 debugPipe :: (Show b) => String -> b -> b
 debugPipe name x = trace (name ++ ": " ++ show x) x
 
+newtype Computation a = InnerCompute (Env -> (Env, a))
+
+data Error
+  = ParseError String
+  | RuntimeError String
+  deriving (Show)
+
+type ErrorfullComputation a = ExceptT Error Computation a
+
 instance Functor Computation where
   -- fmap :: (a -> b) -> Computation a -> Computation b
   fmap = liftM
 
 instance Applicative Computation where
   -- pure :: a -> Computation a
-  pure x = Computation (\env -> (env, x))
+  pure x = InnerCompute (\env -> (env, x))
 
   -- <*> :: Computation (a -> b) -> Computation a -> Computation b
-  (Computation computeFn) <*> (Computation computeArg) =
-    Computation
+  (InnerCompute computeFn) <*> (InnerCompute computeArg) =
+    InnerCompute
       ( \env ->
           let (argEnv, arg) = computeArg env
               -- TODO : what env should fn be evaluated in?
@@ -37,23 +49,59 @@ instance Applicative Computation where
 
 instance Monad Computation where
   -- >>= (Computation a) -> (a -> Computation b) -> (Computation b)
-  (Computation computeA) >>= fn =
-    Computation
+  (InnerCompute computeA) >>= fn =
+    InnerCompute
       ( \env ->
           let -- get argument
               (envA, a) = computeA env
               -- get, and unpack the next computation
-              Computation computeB = fn a
+              InnerCompute computeB = fn a
            in -- execute the computation
               computeB envA
       )
 
--- | Runs a computation in a specific env
+-- | Base monad operations
 compute :: Env -> Computation a -> (Env, a)
-compute env (Computation fn) = fn env
+compute env (InnerCompute fn) = fn env
 
-computeRes :: Env -> Computation a -> a
-computeRes env computation = let (_, res) = compute env computation in res
+getEnv :: Computation Env
+getEnv =
+  InnerCompute (\env -> (env, env))
+
+setEnv :: Env -> Computation ()
+setEnv newEnv =
+  InnerCompute (\_ -> (newEnv, ()))
+
+setEnvForComputation :: Env -> Computation a -> Computation a
+setEnvForComputation otherEnv comp = do
+  initialEnv <- getEnv
+  setEnv otherEnv
+  res <- comp
+  setEnv initialEnv
+  return res
+
+-- | Error monad base operations
+computeWithErrors :: Env -> ErrorfullComputation a -> (Env, Either Error a)
+computeWithErrors env comp = compute env (runExceptT comp)
+
+liftOp :: Computation a -> ErrorfullComputation a
+liftOp comp =
+  ExceptT
+    ( do
+        res <- comp
+        return $ Right res
+    )
+
+getEnvWithErrors :: ErrorfullComputation Env
+getEnvWithErrors = liftOp getEnv
+
+setEnvWithErrors :: Env -> ErrorfullComputation ()
+setEnvWithErrors = liftOp . setEnv
+
+setEnvForComputationWithErrors :: Env -> ErrorfullComputation a -> ErrorfullComputation a
+setEnvForComputationWithErrors env comp =
+  let (_, res) = computeWithErrors env comp
+   in ExceptT (return res)
 
 emptyEnv :: Env
 emptyEnv = Env Map.empty Nothing
@@ -61,91 +109,44 @@ emptyEnv = Env Map.empty Nothing
 getNewEnv :: Env -> Env
 getNewEnv parentEnv = Env Map.empty (Just parentEnv)
 
-inChildEnv :: Computation a -> Computation a
-inChildEnv comp =
-  Computation
-    ( \parentEnv ->
-        let childEnv = getNewEnv parentEnv
-         in (parentEnv, computeRes childEnv comp)
-    )
+inChildEnv :: ErrorfullComputation a -> ErrorfullComputation a
+inChildEnv comp = do
+  env <- getEnvWithErrors
+  let childEnv = getNewEnv env
+  setEnvForComputationWithErrors childEnv comp
 
-currentEnv :: Computation Env
-currentEnv =
-  Computation (\env -> (env, env))
+bind :: String -> Token -> ErrorfullComputation ()
+bind name expression = do
+  (Env mappings parentEnv) <- getEnvWithErrors
+  value <- eval expression
+  let newEnv = mappings & Map.insert name (expression, value)
+  setEnvWithErrors (Env newEnv parentEnv)
 
-inOtherEnv :: Env -> Computation a -> Computation a
-inOtherEnv otherEnv comp =
-  Computation (\env -> (env, computeRes otherEnv comp))
+readBindingExpression :: String -> ErrorfullComputation Token
+readBindingExpression name = do
+  (Env mappings parent) <- getEnvWithErrors
+  let lookupRes = Map.lookup name mappings
+  case (lookupRes, parent) of
+    (Just (expr, _value), _) -> return expr
+    (Nothing, Just parentEnv) -> do
+      setEnvForComputationWithErrors parentEnv (readBindingExpression name)
+    (Nothing, Nothing) -> throwE $ RuntimeError ("name '" ++ name ++ "' not found")
 
-bind :: String -> Token -> Computation ()
-bind name expression =
-  Computation
-    ( \env@(Env mappings parentEnv) ->
-        let value = computeRes env (eval expression)
-         in (Env (mappings & Map.insert name (expression, value)) parentEnv, ())
-    )
-
-readBindingExpression :: String -> Computation Token
-readBindingExpression name =
-  Computation
-    ( \env@(Env mappings parent) ->
-        let lookupRes = Map.lookup name mappings
-         in case (lookupRes, parent) of
-              (Just (expr, _value), _) -> (env, expr)
-              (Nothing, Just parentEnv) -> (env, computeRes parentEnv (readBindingExpression name))
-              (Nothing, Nothing) -> (env, ParseError ("name '" ++ name ++ "' not found"))
-    )
-
-readBinding :: String -> Computation Token
-readBinding name =
-  Computation
-    ( \env@(Env mappings parent) ->
-        let lookupRes = Map.lookup name mappings
-         in case (lookupRes, parent) of
-              (Just (_expr, value), _) -> (env, value)
-              (Nothing, Just parentEnv) -> (env, computeRes parentEnv (readBinding name))
-              (Nothing, Nothing) -> (env, ParseError ("name '" ++ name ++ "' not found"))
-    )
+readBinding :: String -> ErrorfullComputation Token
+readBinding name = do
+  (Env mappings parent) <- getEnvWithErrors
+  let lookupRes = Map.lookup name mappings
+  case (lookupRes, parent) of
+    (Just (_expr, value), _) -> return value
+    (Nothing, Just parentEnv) -> do
+      setEnvForComputationWithErrors parentEnv (readBinding name)
+    (Nothing, Nothing) -> throwE $ RuntimeError ("name '" ++ name ++ "' not found")
 
 -- | The default environment is not the empty environment!
 defaultEnv :: Env
 defaultEnv = emptyEnv
 
-evalManyStrings :: String -> [String] -> Computation String
-evalManyStrings final [] = pure final
-evalManyStrings str (c : cs) = do
-  res <- rep c
-  evalManyStrings (str ++ "\n\n> " ++ c ++ "\n" ++ res) cs
-
-rep :: String -> Computation String
-rep input =
-  let expr =
-        input
-          & Parsec.parse parseTopExpression "(source)"
-          & Either.either (\err -> err & show & ParseError) id
-   in do
-        res <- eval expr
-        return $
-          ""
-            ++ "parsed: "
-            ++ show expr
-            ++ "\n"
-            ++ "eval  : "
-            ++ show res
-
-repl :: Env -> IO ()
-repl env = do
-  putStr "\n> "
-  hFlush stdout
-  input <- getLine
-  if null input
-    then return ()
-    else do
-      let (resEnv, res) = compute env (rep input)
-      putStrLn res
-      repl resEnv
-
-nativeFn :: String -> (Integer -> Integer -> Integer) -> Token -> Token -> Computation Token
+nativeFn :: String -> (Integer -> Integer -> Integer) -> Token -> Token -> ErrorfullComputation Token
 nativeFn fnName fn argA argB = do
   evalA <- eval argA
   evalB <- eval argB
@@ -153,7 +154,7 @@ nativeFn fnName fn argA argB = do
     (EInteger x, EInteger y) -> return $ EInteger (fn x y)
     (_, _) -> return $ Call (Name fnName) [evalA, evalB]
 
-eval :: Token -> Computation Token
+eval :: Token -> ErrorfullComputation Token
 eval (Call (Name "+") [xExpr, yExpr]) = nativeFn "+" (+) xExpr yExpr
 eval (Call (Name "-") [xExpr, yExpr]) = nativeFn "-" (-) xExpr yExpr
 eval (Call (Name "*") [xExpr, yExpr]) = nativeFn "*" (*) xExpr yExpr
@@ -168,7 +169,7 @@ eval (Call (Name "=") [xExpr, yExpr]) = do
     (Name x, Name y) -> return $ EBool (x == y)
     (EBool x, EBool y) -> return $ EBool (x == y)
     (Quote (Name x), Quote (Name y)) -> return $ EBool (x == y)
-    (_, _) -> return $ ParseError $ "Don't know how to compare \"" ++ show xValue ++ "\" and \"" ++ show yValue ++ "\""
+    (_, _) -> do throwE $ RuntimeError $ "Don't know how to compare \"" ++ show xValue ++ "\" and \"" ++ show yValue ++ "\""
 eval (Quote expr) = return expr
 eval (Call (Name "bindIn") [nameExpr, valueExpr, body]) = do
   nameValue <- eval nameExpr
@@ -177,12 +178,12 @@ eval (Call (Name "bindIn") [nameExpr, valueExpr, body]) = do
       do
         bind n valueExpr
         eval body
-    _ -> return $ ParseError ("Error calling bind, name is " ++ show nameValue)
+    _ -> do throwE $ RuntimeError ("Error calling bind, name is " ++ show nameValue)
 eval (Call (Name "bind") [nameExpr, valueExpr]) = do
   nameValue <- eval nameExpr
   case nameValue of
     Name n -> do bind n valueExpr; return valueExpr
-    _ -> return $ ParseError ("Error calling bind, name is " ++ show nameValue)
+    _ -> do throwE $ RuntimeError ("Error calling bind, name is " ++ show nameValue)
 eval (Call (Name "head") [Call callFn _]) = return callFn
 -- TODO figure out a list semantic
 eval (Call (Name "tail") [Call _ []]) = return (Name "empty")
@@ -214,27 +215,75 @@ eval (IfElse condExpr trueExpr falseExpr) = do
   case condValue of
     EBool True -> eval trueExpr
     EBool False -> eval falseExpr
-    _ -> return $ ParseError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"")
+    _ -> throwE $ ParseError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"")
 eval (Lambda args bodyExpr) = do
-  env <- currentEnv
+  env <- getEnvWithErrors
   return $ CapturedLambda env (evalLambda args bodyExpr)
 eval (Call callExpr argExprs) = do
   fn <- eval callExpr
   case fn of
-    CapturedLambda env fnComputation -> inOtherEnv env (eval (fnComputation argExprs))
+    CapturedLambda env fnComputation -> setEnvForComputationWithErrors env (eval (fnComputation argExprs))
     _ ->
-      pure (ParseError ("I don't know how to call: " ++ show fn))
+      throwE (ParseError ("I don't know how to call: " ++ show fn))
 eval (EInteger x) = return $ EInteger x
 eval (EString s) = return $ EString s
-eval expr = return $ ParseError ("Not yet implemented: " ++ show expr)
+eval expr = throwE $ ParseError ("Not yet implemented: " ++ show expr)
 
 evalLambda :: [String] -> Token -> [Token] -> Token
 evalLambda [] body [] = body
-evalLambda [] _ _ = ParseError "Too many arguments"
-evalLambda _ _ [] = ParseError "Not enough arguments"
+-- evalLambda [] _ _ = ParseError "Too many arguments"
+-- evalLambda _ _ [] = ParseError "Not enough arguments"
 evalLambda (n : ns) body (argExpr : as) =
   let newbody = Let [(n, argExpr)] body
    in evalLambda ns newbody as
+
+-------- Main ---------
+
+showWithError :: Either Error String -> String
+showWithError res =
+  case res of
+    Right expr -> expr
+    Left err -> "error: " ++ show err
+
+evalManyStrings :: String -> [String] -> ErrorfullComputation String
+evalManyStrings final [] = pure final
+evalManyStrings str (c : cs) = do
+  res <-
+    catchE
+      (rep c)
+      ( \err ->
+          ExceptT (do return $ Right (show err))
+      )
+  evalManyStrings (str ++ "\n\n> " ++ c ++ "\n" ++ res) cs
+
+rep :: String -> ErrorfullComputation String
+rep input =
+  let parseRes =
+        input
+          & Parsec.parse parseTopExpression "(source)"
+   in case parseRes of
+        Right expr -> do
+          res <- eval expr
+          return $
+            "parsed: "
+              ++ show expr
+              ++ "\n"
+              ++ "eval  : "
+              ++ show res
+        Left err -> do
+          return $ "error " ++ show err
+
+repl :: Env -> IO ()
+repl env = do
+  putStr "\n> "
+  hFlush stdout
+  input <- getLine
+  if null input
+    then return ()
+    else do
+      let (resEnv, errorfulRes) = computeWithErrors env (rep input)
+      print (showWithError errorfulRes)
+      repl resEnv
 
 main :: IO ()
 main =
@@ -259,8 +308,8 @@ main =
           "arg",
           "(define square (lambda (arg) (* arg arg)))",
           "square",
-          "(square)",
-          "(square x y)",
+          -- "(square)",
+          -- "(square x y)",
           "(square x)",
           "(square z)",
           "(define mass (quote m))",
@@ -304,15 +353,15 @@ main =
           "\"done\""
         ]
 
-      evaluations :: Computation String
+      evaluations :: ErrorfullComputation String
       evaluations = evalManyStrings "Starting autoevaluation...\n" test_cases
 
-      finalRes :: String
-      (finalEnv, finalRes) = compute defaultEnv evaluations
+      finalRes :: Either Error String
+      (finalEnv, finalRes) = computeWithErrors defaultEnv evaluations
    in do
         putStrLn ""
         -- putStr (concatMap (\(expr, res) -> "> " ++ expr ++ "\n\t" ++ show res ++ "\n\n") parsedExpressions)
-        putStrLn finalRes
+        putStr (showWithError finalRes)
 
         repl finalEnv
         putStrLn "done"

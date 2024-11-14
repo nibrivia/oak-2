@@ -1,7 +1,7 @@
 {-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
 
 {-# HLINT ignore "Use <$>" #-}
-module Parser (Token (..), Computation (..), Env (..), parseExpression, parseTopExpression) where
+module Parser (Token (..), Env (..), parseExpression, parseTopExpression) where
 
 import Control.Applicative
 import Data.Function
@@ -26,13 +26,8 @@ data Token
   | Define String Token
   | DefineType String Token
   | Call Token [Token]
-  | ParseError String
 
 data Env = Env (Map.Map String (Token, Token)) (Maybe Env)
-
-newtype Computation a = Computation (Env -> (Env, a))
-
-
 
 instance Show Token where
   show (EInteger x) = show x
@@ -46,7 +41,6 @@ instance Show Token where
   show (IfElse cond trueExpr falseExpr) = "(if " ++ show cond ++ " " ++ show trueExpr ++ " " ++ show falseExpr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
   show (Call fn args) = "(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
-  show (ParseError err) = "Error: " ++ err
   show _ = "unknown expression"
 
 parseName :: Parsec.Parsec String () Token
