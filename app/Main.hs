@@ -4,116 +4,93 @@
 {-# HLINT ignore "Use tuple-section" #-}
 module Main (main) where
 
-import Control.Monad (foldM_, liftM)
+import Control.Monad (foldM_)
+import Control.Monad.Trans.Class
 import Control.Monad.Trans.Except
-import Control.Monad.Trans.Identity
 import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
 import Control.Monad.Trans.Writer
 import Data.Function
+-- import qualified Data.Functor.Identity.Identity
 import qualified Data.Map as Map
 import Debug.Trace
 import Parser
 import System.IO
 import qualified Text.Parsec as Parsec
 
-debugPipe :: (Show b) => String -> b -> b
-debugPipe name x = trace (name ++ ": " ++ show x) x
-
-type Computation = State Env
-
 data Error
   = ParseError String
   | RuntimeError String
   deriving (Show)
 
-type ErrorfullComputation a = ExceptT Error Computation a
+debugPipe :: (Show b) => String -> b -> b
+debugPipe name x = trace (name ++ ": " ++ show x) x
 
--- | Base monad operations
-compute :: Env -> Computation a -> (a, Env)
-compute = flip runState
+makeChildEnv :: Env -> Env
+makeChildEnv parentEnv = Env Map.empty (Just parentEnv)
 
-getEnv :: Computation Env
-getEnv = get
-
-setEnv :: Env -> Computation ()
-setEnv = put
-
-setEnvForComputation :: Env -> Computation a -> Computation a
-setEnvForComputation otherEnv comp = do
-  initialEnv <- getEnv
-  setEnv otherEnv
-  res <- comp
-  setEnv initialEnv
-  return res
+-- type ErrorfullComputation a = ExceptT Error (StateT Env Data.Functor.Identity.Identity) a
+type Computation a = ExceptT Error (State Env) a
 
 -- | Error monad base operations
-computeWithErrors :: Env -> ErrorfullComputation a -> (Either Error a, Env)
-computeWithErrors env comp = compute env (runExceptT comp)
+compute :: Env -> Computation a -> (Either Error a, Env)
+compute env comp = runState (runExceptT comp) env
 
-liftOp :: Computation a -> ErrorfullComputation a
-liftOp comp =
-  ExceptT
-    ( do
-        res <- comp
-        return $ Right res
-    )
+getEnv :: Computation Env
+getEnv = lift get
 
-getEnvWithErrors :: ErrorfullComputation Env
-getEnvWithErrors = liftOp getEnv
+setEnv :: Env -> Computation ()
+setEnv = lift . put
 
-setEnvWithErrors :: Env -> ErrorfullComputation ()
-setEnvWithErrors env = liftOp (setEnv env)
-
-setEnvForComputationWithErrors :: Env -> ErrorfullComputation a -> ErrorfullComputation a
-setEnvForComputationWithErrors env comp =
-  let (res, _) = computeWithErrors env comp
-   in ExceptT (return res)
+runInEnv :: Env -> Computation a -> Computation a
+runInEnv env comp = do
+  cur_env <- getEnv
+  setEnv env
+  res <- comp
+  setEnv cur_env
+  return res
 
 emptyEnv :: Env
 emptyEnv = Env Map.empty Nothing
 
-getNewEnv :: Env -> Env
-getNewEnv parentEnv = Env Map.empty (Just parentEnv)
+runInChildEnv :: Computation a -> Computation a
+runInChildEnv comp = do
+  env <- getEnv
+  let childEnv = makeChildEnv env
+  runInEnv childEnv comp
 
-inChildEnv :: ErrorfullComputation a -> ErrorfullComputation a
-inChildEnv comp = do
-  env <- getEnvWithErrors
-  let childEnv = getNewEnv env
-  setEnvForComputationWithErrors childEnv comp
-
-bind :: String -> Token -> ErrorfullComputation ()
+bind :: String -> Token -> Computation ()
 bind name expression = do
-  (Env mappings parentEnv) <- getEnvWithErrors
+  (Env mappings parentEnv) <- getEnv
   value <- eval expression
   let newEnv = mappings & Map.insert name (expression, value)
-  setEnvWithErrors (Env newEnv parentEnv)
+  setEnv (Env newEnv parentEnv)
 
-readBindingExpression :: String -> ErrorfullComputation Token
+readBindingExpression :: String -> Computation Token
 readBindingExpression name = do
-  (Env mappings parent) <- getEnvWithErrors
+  (Env mappings parent) <- getEnv
   let lookupRes = Map.lookup name mappings
   case (lookupRes, parent) of
     (Just (expr, _value), _) -> return expr
     (Nothing, Just parentEnv) -> do
-      setEnvForComputationWithErrors parentEnv (readBindingExpression name)
+      runInEnv parentEnv (readBindingExpression name)
     (Nothing, Nothing) -> throwE $ RuntimeError ("name '" ++ name ++ "' not found")
 
-readBinding :: String -> ErrorfullComputation Token
+readBinding :: String -> Computation Token
 readBinding name = do
-  (Env mappings parent) <- getEnvWithErrors
+  (Env mappings parent) <- getEnv
   let lookupRes = Map.lookup name mappings
   case (lookupRes, parent) of
     (Just (_expr, value), _) -> return value
     (Nothing, Just parentEnv) -> do
-      setEnvForComputationWithErrors parentEnv (readBinding name)
+      runInEnv parentEnv (readBinding name)
     (Nothing, Nothing) -> throwE $ RuntimeError ("name '" ++ name ++ "' not found")
 
 -- | The default environment is not the empty environment!
 defaultEnv :: Env
 defaultEnv = emptyEnv
 
-nativeFn :: String -> (Integer -> Integer -> Integer) -> Token -> Token -> ErrorfullComputation Token
+nativeFn :: String -> (Integer -> Integer -> Integer) -> Token -> Token -> Computation Token
 nativeFn fnName fn argA argB = do
   evalA <- eval argA
   evalB <- eval argB
@@ -121,7 +98,7 @@ nativeFn fnName fn argA argB = do
     (EInteger x, EInteger y) -> return $ EInteger (fn x y)
     (_, _) -> return $ Call (Name fnName) [evalA, evalB]
 
-eval :: Token -> ErrorfullComputation Token
+eval :: Token -> Computation Token
 eval (Call (Name "+") [xExpr, yExpr]) = nativeFn "+" (+) xExpr yExpr
 eval (Call (Name "-") [xExpr, yExpr]) = nativeFn "-" (-) xExpr yExpr
 eval (Call (Name "*") [xExpr, yExpr]) = nativeFn "*" (*) xExpr yExpr
@@ -166,7 +143,7 @@ eval (Call (Name "eval") [expr]) = do
   -- and one to actually do the "eval"
   eval res
 eval (Let bindings expression) =
-  inChildEnv $ do
+  runInChildEnv $ do
     foldM_ (\_ (name, value) -> do bind name value) () bindings
     eval expression
 eval (Define name expression) = do
@@ -184,7 +161,7 @@ eval (IfElse condExpr trueExpr falseExpr) = do
     EBool False -> eval falseExpr
     _ -> throwE $ RuntimeError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"")
 eval (Lambda argNames bodyExpr) = do
-  env <- getEnvWithErrors
+  env <- getEnv
   return $ CapturedLambda env argNames bodyExpr
 eval (Call callExpr argExprs) = do
   fn <- eval callExpr
@@ -197,8 +174,8 @@ eval (EInteger x) = return $ EInteger x
 eval (EString s) = return $ EString s
 eval expr = throwE $ RuntimeError ("Not yet implemented: " ++ show expr)
 
-evalLambda :: [String] -> [Token] -> Env -> Token -> ErrorfullComputation Token
-evalLambda [] [] env body = setEnvForComputationWithErrors env $ eval body
+evalLambda :: [String] -> [Token] -> Env -> Token -> Computation Token
+evalLambda [] [] env body = runInEnv env $ eval body
 evalLambda [] _ _ _ = throwE $ RuntimeError "Too many arguments"
 evalLambda _ [] _ _ = throwE $ RuntimeError "Not enough arguments"
 evalLambda (n : ns) (argExpr : as) env body =
@@ -213,7 +190,7 @@ showWithError res =
     Right expr -> expr
     Left err -> "error: " ++ show err
 
-evalManyStrings :: String -> [String] -> ErrorfullComputation String
+evalManyStrings :: String -> [String] -> Computation String
 evalManyStrings final [] = pure final
 evalManyStrings str (c : cs) = do
   res <-
@@ -224,7 +201,7 @@ evalManyStrings str (c : cs) = do
       )
   evalManyStrings (str ++ "\n\n> " ++ c ++ "\n" ++ res) cs
 
-rep :: String -> ErrorfullComputation String
+rep :: String -> Computation String
 rep input =
   let parseRes =
         input
@@ -249,7 +226,7 @@ repl env = do
   if null input
     then return ()
     else do
-      let (errorfulRes, resEnv) = computeWithErrors env (rep input)
+      let (errorfulRes, resEnv) = compute env (rep input)
       print (showWithError errorfulRes)
       repl resEnv
 
@@ -321,11 +298,11 @@ main =
           "\"done\""
         ]
 
-      evaluations :: ErrorfullComputation String
+      evaluations :: Computation String
       evaluations = evalManyStrings "Starting autoevaluation...\n" test_cases
 
       finalRes :: Either Error String
-      (finalRes, finalEnv) = computeWithErrors defaultEnv evaluations
+      (finalRes, finalEnv) = compute defaultEnv evaluations
    in do
         putStrLn ""
         -- putStr (concatMap (\(expr, res) -> "> " ++ expr ++ "\n\t" ++ show res ++ "\n\n") parsedExpressions)
