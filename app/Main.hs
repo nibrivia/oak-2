@@ -4,12 +4,12 @@
 {-# HLINT ignore "Use tuple-section" #-}
 module Main (main) where
 
-import Control.Applicative
-import Control.Monad (foldM, foldM_, liftM)
+import Control.Monad (foldM_, liftM)
 import Control.Monad.Trans.Except
 import Control.Monad.Trans.Identity
-import Control.Monad.Trans.Maybe
-import qualified Data.Either as Either
+import Control.Monad.Trans.Reader
+import Control.Monad.Trans.State
+import Control.Monad.Trans.Writer
 import Data.Function
 import qualified Data.Map as Map
 import Debug.Trace
@@ -20,7 +20,7 @@ import qualified Text.Parsec as Parsec
 debugPipe :: (Show b) => String -> b -> b
 debugPipe name x = trace (name ++ ": " ++ show x) x
 
-newtype Computation a = InnerCompute (Env -> (Env, a))
+type Computation = State Env
 
 data Error
   = ParseError String
@@ -29,48 +29,15 @@ data Error
 
 type ErrorfullComputation a = ExceptT Error Computation a
 
-instance Functor Computation where
-  -- fmap :: (a -> b) -> Computation a -> Computation b
-  fmap = liftM
-
-instance Applicative Computation where
-  -- pure :: a -> Computation a
-  pure x = InnerCompute (\env -> (env, x))
-
-  -- <*> :: Computation (a -> b) -> Computation a -> Computation b
-  (InnerCompute computeFn) <*> (InnerCompute computeArg) =
-    InnerCompute
-      ( \env ->
-          let (argEnv, arg) = computeArg env
-              -- TODO : what env should fn be evaluated in?
-              (fnEnv, concreteFn) = computeFn argEnv
-           in (fnEnv, concreteFn arg)
-      )
-
-instance Monad Computation where
-  -- >>= (Computation a) -> (a -> Computation b) -> (Computation b)
-  (InnerCompute computeA) >>= fn =
-    InnerCompute
-      ( \env ->
-          let -- get argument
-              (envA, a) = computeA env
-              -- get, and unpack the next computation
-              InnerCompute computeB = fn a
-           in -- execute the computation
-              computeB envA
-      )
-
 -- | Base monad operations
-compute :: Env -> Computation a -> (Env, a)
-compute env (InnerCompute fn) = fn env
+compute :: Env -> Computation a -> (a, Env)
+compute = flip runState
 
 getEnv :: Computation Env
-getEnv =
-  InnerCompute (\env -> (env, env))
+getEnv = get
 
 setEnv :: Env -> Computation ()
-setEnv newEnv =
-  InnerCompute (\_ -> (newEnv, ()))
+setEnv = put
 
 setEnvForComputation :: Env -> Computation a -> Computation a
 setEnvForComputation otherEnv comp = do
@@ -81,7 +48,7 @@ setEnvForComputation otherEnv comp = do
   return res
 
 -- | Error monad base operations
-computeWithErrors :: Env -> ErrorfullComputation a -> (Env, Either Error a)
+computeWithErrors :: Env -> ErrorfullComputation a -> (Either Error a, Env)
 computeWithErrors env comp = compute env (runExceptT comp)
 
 liftOp :: Computation a -> ErrorfullComputation a
@@ -96,11 +63,11 @@ getEnvWithErrors :: ErrorfullComputation Env
 getEnvWithErrors = liftOp getEnv
 
 setEnvWithErrors :: Env -> ErrorfullComputation ()
-setEnvWithErrors = liftOp . setEnv
+setEnvWithErrors env = liftOp (setEnv env)
 
 setEnvForComputationWithErrors :: Env -> ErrorfullComputation a -> ErrorfullComputation a
 setEnvForComputationWithErrors env comp =
-  let (_, res) = computeWithErrors env comp
+  let (res, _) = computeWithErrors env comp
    in ExceptT (return res)
 
 emptyEnv :: Env
@@ -282,7 +249,7 @@ repl env = do
   if null input
     then return ()
     else do
-      let (resEnv, errorfulRes) = computeWithErrors env (rep input)
+      let (errorfulRes, resEnv) = computeWithErrors env (rep input)
       print (showWithError errorfulRes)
       repl resEnv
 
@@ -358,7 +325,7 @@ main =
       evaluations = evalManyStrings "Starting autoevaluation...\n" test_cases
 
       finalRes :: Either Error String
-      (finalEnv, finalRes) = computeWithErrors defaultEnv evaluations
+      (finalRes, finalEnv) = computeWithErrors defaultEnv evaluations
    in do
         putStrLn ""
         -- putStr (concatMap (\(expr, res) -> "> " ++ expr ++ "\n\t" ++ show res ++ "\n\n") parsedExpressions)
