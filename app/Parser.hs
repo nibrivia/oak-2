@@ -20,7 +20,7 @@ data Token
   | List [Token]
   | Lambda [String] Token
   | Let [(String, Token)] Token
-  | CapturedLambda Env ([Token] -> Token)
+  | CapturedLambda Env [String] Token
   | Quote Token
   | IfElse Token Token Token
   | Define String Token
@@ -41,7 +41,8 @@ instance Show Token where
   show (IfElse cond trueExpr falseExpr) = "(if " ++ show cond ++ " " ++ show trueExpr ++ " " ++ show falseExpr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
   show (Call fn args) = "(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
-  show _ = "unknown expression"
+  show (CapturedLambda _ _ _) = "<captured lambda>"
+  show _ = "(don't know how to display this expression)"
 
 parseName :: Parsec.Parsec String () Token
 parseName = do

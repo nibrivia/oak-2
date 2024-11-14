@@ -215,27 +215,28 @@ eval (IfElse condExpr trueExpr falseExpr) = do
   case condValue of
     EBool True -> eval trueExpr
     EBool False -> eval falseExpr
-    _ -> throwE $ ParseError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"")
-eval (Lambda args bodyExpr) = do
+    _ -> throwE $ RuntimeError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"")
+eval (Lambda argNames bodyExpr) = do
   env <- getEnvWithErrors
-  return $ CapturedLambda env (evalLambda args bodyExpr)
+  return $ CapturedLambda env argNames bodyExpr
 eval (Call callExpr argExprs) = do
   fn <- eval callExpr
   case fn of
-    CapturedLambda env fnComputation -> setEnvForComputationWithErrors env (eval (fnComputation argExprs))
+    CapturedLambda env argNames body ->
+      evalLambda argNames argExprs env body
     _ ->
-      throwE (ParseError ("I don't know how to call: " ++ show fn))
+      throwE (RuntimeError ("I don't know how to call: " ++ show fn))
 eval (EInteger x) = return $ EInteger x
 eval (EString s) = return $ EString s
-eval expr = throwE $ ParseError ("Not yet implemented: " ++ show expr)
+eval expr = throwE $ RuntimeError ("Not yet implemented: " ++ show expr)
 
-evalLambda :: [String] -> Token -> [Token] -> Token
-evalLambda [] body [] = body
--- evalLambda [] _ _ = ParseError "Too many arguments"
--- evalLambda _ _ [] = ParseError "Not enough arguments"
-evalLambda (n : ns) body (argExpr : as) =
+evalLambda :: [String] -> [Token] -> Env -> Token -> ErrorfullComputation Token
+evalLambda [] [] env body = setEnvForComputationWithErrors env $ eval body
+evalLambda [] _ _ _ = throwE $ RuntimeError "Too many arguments"
+evalLambda _ [] _ _ = throwE $ RuntimeError "Not enough arguments"
+evalLambda (n : ns) (argExpr : as) env body =
   let newbody = Let [(n, argExpr)] body
-   in evalLambda ns newbody as
+   in evalLambda ns as env newbody
 
 -------- Main ---------
 
@@ -308,8 +309,8 @@ main =
           "arg",
           "(define square (lambda (arg) (* arg arg)))",
           "square",
-          -- "(square)",
-          -- "(square x y)",
+          "(square)",
+          "(square x y)",
           "(square x)",
           "(square z)",
           "(define mass (quote m))",
@@ -345,8 +346,8 @@ main =
           "(define add (lambda (a) (lambda (b) (+ b a))))",
           "(define inc (add 1))",
           "(inc 2)",
-          "(define defun (lambda (argName body) (lambda (argValue) (bindIn (head (eval (enquote argName))) argValue body))))",
-          "(define s (defun (num) (+ num num)))",
+          "(define defun (lambda (argName body) (lambda (argValue) (bindIn (head (eval (enquote argName))) argValue (enquote body)))))",
+          "(define s (defun (quote num) (+ num 97)))",
           "(s 3)",
           "((eval s) 3)",
           "(enquote s)",
