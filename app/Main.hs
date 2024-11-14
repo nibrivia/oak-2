@@ -11,17 +11,24 @@ import Control.Monad.Trans.Reader
 import Control.Monad.Trans.State
 import Control.Monad.Trans.Writer
 import Data.Function
--- import qualified Data.Functor.Identity.Identity
 import qualified Data.Map as Map
 import Debug.Trace
 import Parser
 import System.IO
 import qualified Text.Parsec as Parsec
 
-data Error
-  = ParseError String
-  | RuntimeError String
-  deriving (Show)
+data ErrorType = ParseError | RuntimeError deriving (Eq, Show)
+
+data Error = Error
+  { errorType :: ErrorType,
+    message :: String,
+    stack :: [String]
+  }
+  deriving (Eq)
+
+instance Show Error where
+  show (Error eType msg sTrace) =
+    show eType ++ ": " ++ msg ++ " in:\n" ++ (sTrace & map ("    " ++) & reverse & unlines)
 
 debugPipe :: (Show b) => String -> b -> b
 debugPipe name x = trace (name ++ ": " ++ show x) x
@@ -29,18 +36,34 @@ debugPipe name x = trace (name ++ ": " ++ show x) x
 makeChildEnv :: Env -> Env
 makeChildEnv parentEnv = Env Map.empty (Just parentEnv)
 
--- type ErrorfullComputation a = ExceptT Error (StateT Env Data.Functor.Identity.Identity) a
-type Computation a = ExceptT Error (State Env) a
+-- TODO make sure failures during executing in a different env does not screw return env
+type Computation a = (ExceptT Error (ReaderT [String] (State Env))) a
 
 -- | Error monad base operations
 compute :: Env -> Computation a -> (Either Error a, Env)
-compute env comp = runState (runExceptT comp) env
+-- compute env comp = runState (runReaderT (runExceptT comp) []) env
+compute env comp =
+  comp
+    & runExceptT
+    & flip runReaderT []
+    & flip runState env
 
 getEnv :: Computation Env
-getEnv = lift get
+getEnv = lift (lift get)
 
 setEnv :: Env -> Computation ()
-setEnv = lift . put
+setEnv = lift . lift . put
+
+withTrace :: String -> Computation a -> Computation a
+withTrace str comp = do
+  cur_stack <- lift ask
+  mapExceptT (local (const (cur_stack ++ [str]))) comp
+
+throwWithTrace :: Error -> Computation a
+throwWithTrace err = do
+  cur_stack <- lift ask
+  let new_err = err {stack = cur_stack}
+  throwE new_err
 
 runInEnv :: Env -> Computation a -> Computation a
 runInEnv env comp = do
@@ -74,7 +97,7 @@ readBindingExpression name = do
     (Just (expr, _value), _) -> return expr
     (Nothing, Just parentEnv) -> do
       runInEnv parentEnv (readBindingExpression name)
-    (Nothing, Nothing) -> throwE $ RuntimeError ("name '" ++ name ++ "' not found")
+    (Nothing, Nothing) -> throwWithTrace $ Error {errorType = RuntimeError, message = "name '" ++ name ++ "' not found", stack = []}
 
 readBinding :: String -> Computation Token
 readBinding name = do
@@ -84,7 +107,7 @@ readBinding name = do
     (Just (_expr, value), _) -> return value
     (Nothing, Just parentEnv) -> do
       runInEnv parentEnv (readBinding name)
-    (Nothing, Nothing) -> throwE $ RuntimeError ("name '" ++ name ++ "' not found")
+    (Nothing, Nothing) -> throwWithTrace $ Error RuntimeError ("name '" ++ name ++ "' not found") []
 
 -- | The default environment is not the empty environment!
 defaultEnv :: Env
@@ -98,6 +121,9 @@ nativeFn fnName fn argA argB = do
     (EInteger x, EInteger y) -> return $ EInteger (fn x y)
     (_, _) -> return $ Call (Name fnName) [evalA, evalB]
 
+traceEval :: Token -> Computation Token
+traceEval expr = withTrace (show expr) $ eval expr
+
 eval :: Token -> Computation Token
 eval (Call (Name "+") [xExpr, yExpr]) = nativeFn "+" (+) xExpr yExpr
 eval (Call (Name "-") [xExpr, yExpr]) = nativeFn "-" (-) xExpr yExpr
@@ -105,29 +131,29 @@ eval (Call (Name "*") [xExpr, yExpr]) = nativeFn "*" (*) xExpr yExpr
 eval (Call (Name "/") [xExpr, yExpr]) = nativeFn "/" div xExpr yExpr
 eval (Call (Name "%") [xExpr, yExpr]) = nativeFn "%" rem xExpr yExpr
 eval (Call (Name "=") [xExpr, yExpr]) = do
-  xValue <- eval (xExpr & debugPipe "= first arg expr")
-  yValue <- eval yExpr
+  xValue <- traceEval (xExpr & debugPipe "= first arg expr")
+  yValue <- traceEval yExpr
   case (xValue & debugPipe "= first arg value", yValue) of
     (EInteger x, EInteger y) -> return $ EBool (x == y)
     (EString x, EString y) -> return $ EBool (x == y)
     (Name x, Name y) -> return $ EBool (x == y)
     (EBool x, EBool y) -> return $ EBool (x == y)
     (Quote (Name x), Quote (Name y)) -> return $ EBool (x == y)
-    (_, _) -> do throwE $ RuntimeError $ "Don't know how to compare \"" ++ show xValue ++ "\" and \"" ++ show yValue ++ "\""
+    (_, _) -> do throwWithTrace $ Error RuntimeError ("Don't know how to compare \"" ++ show xValue ++ "\" and \"" ++ show yValue ++ "\"") []
 eval (Quote expr) = return expr
 eval (Call (Name "bindIn") [nameExpr, valueExpr, body]) = do
-  nameValue <- eval nameExpr
+  nameValue <- traceEval nameExpr
   case nameValue of
     Name n ->
       do
         bind n valueExpr
-        eval body
-    _ -> do throwE $ RuntimeError ("Error calling bind, name is " ++ show nameValue)
+        traceEval body
+    _ -> do throwWithTrace $ Error RuntimeError ("Error calling bind, name is " ++ show nameValue) []
 eval (Call (Name "bind") [nameExpr, valueExpr]) = do
-  nameValue <- eval nameExpr
+  nameValue <- traceEval nameExpr
   case nameValue of
     Name n -> do bind n valueExpr; return valueExpr
-    _ -> do throwE $ RuntimeError ("Error calling bind, name is " ++ show nameValue)
+    _ -> do throwWithTrace $ Error RuntimeError ("Error calling bind, name is " ++ show nameValue) []
 eval (Call (Name "head") [Call callFn _]) = return callFn
 -- TODO figure out a list semantic
 eval (Call (Name "tail") [Call _ []]) = return (Name "empty")
@@ -138,46 +164,46 @@ eval (Call (Name "enquote") [Name n]) = do
 eval (Call (Name "eval") [expr]) = do
   -- we need two evals here:
   -- one to eagerly evaluate the argument, which we always do
-  res <- eval expr
+  res <- traceEval expr
 
   -- and one to actually do the "eval"
-  eval res
+  traceEval res
 eval (Let bindings expression) =
   runInChildEnv $ do
     foldM_ (\_ (name, value) -> do bind name value) () bindings
-    eval expression
+    traceEval expression
 eval (Define name expression) = do
   -- Currently we eagerly evaluate
-  evaluatedExpression <- eval expression
+  evaluatedExpression <- traceEval expression
   bind name expression
   return evaluatedExpression
 eval (Name x) =
   -- eager evaluation means we don't evaluate on lookup
   readBinding x
 eval (IfElse condExpr trueExpr falseExpr) = do
-  condValue <- eval condExpr
+  condValue <- traceEval condExpr
   case condValue of
-    EBool True -> eval trueExpr
-    EBool False -> eval falseExpr
-    _ -> throwE $ RuntimeError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"")
+    EBool True -> traceEval trueExpr
+    EBool False -> traceEval falseExpr
+    _ -> throwWithTrace $ Error RuntimeError ("Ifelse needs a boolean, but got \"" ++ show condValue ++ "\"") []
 eval (Lambda argNames bodyExpr) = do
   env <- getEnv
   return $ CapturedLambda env argNames bodyExpr
 eval (Call callExpr argExprs) = do
-  fn <- eval callExpr
+  fn <- traceEval callExpr
   case fn of
     CapturedLambda env argNames body ->
       evalLambda argNames argExprs env body
     _ ->
-      throwE (RuntimeError ("I don't know how to call: " ++ show fn))
+      throwWithTrace $ Error RuntimeError ("I don't know how to call: " ++ show fn) []
 eval (EInteger x) = return $ EInteger x
 eval (EString s) = return $ EString s
-eval expr = throwE $ RuntimeError ("Not yet implemented: " ++ show expr)
+eval expr = throwWithTrace $ Error RuntimeError ("Not yet implemented: " ++ show expr) []
 
 evalLambda :: [String] -> [Token] -> Env -> Token -> Computation Token
-evalLambda [] [] env body = runInEnv env $ eval body
-evalLambda [] _ _ _ = throwE $ RuntimeError "Too many arguments"
-evalLambda _ [] _ _ = throwE $ RuntimeError "Not enough arguments"
+evalLambda [] [] env body = runInEnv env $ traceEval body
+evalLambda [] _ _ _ = throwWithTrace $ Error RuntimeError "Too many arguments" []
+evalLambda _ [] _ _ = throwWithTrace $ Error RuntimeError "Not enough arguments" []
 evalLambda (n : ns) (argExpr : as) env body =
   let newbody = Let [(n, argExpr)] body
    in evalLambda ns as env newbody
@@ -193,12 +219,7 @@ showWithError res =
 evalManyStrings :: String -> [String] -> Computation String
 evalManyStrings final [] = pure final
 evalManyStrings str (c : cs) = do
-  res <-
-    catchE
-      (rep c)
-      ( \err ->
-          ExceptT (do return $ Right (show err))
-      )
+  res <- catchE (rep c) (\err -> return (show err))
   evalManyStrings (str ++ "\n\n> " ++ c ++ "\n" ++ res) cs
 
 rep :: String -> Computation String
@@ -208,7 +229,7 @@ rep input =
           & Parsec.parse parseTopExpression "(source)"
    in case parseRes of
         Right expr -> do
-          res <- eval expr
+          res <- traceEval expr
           return $
             "parsed: "
               ++ show expr
@@ -227,7 +248,7 @@ repl env = do
     then return ()
     else do
       let (errorfulRes, resEnv) = compute env (rep input)
-      print (showWithError errorfulRes)
+      putStrLn (showWithError errorfulRes)
       repl resEnv
 
 main :: IO ()
@@ -252,11 +273,13 @@ main =
           "((lambda (arg) (* arg arg)) 5)",
           "arg",
           "(define square (lambda (arg) (* arg arg)))",
+          "(square (quote x))",
           "square",
           "(square)",
           "(square x y)",
           "(square x)",
           "(square z)",
+          "(square x)",
           "(define mass (quote m))",
           "mass",
           "m",
@@ -307,6 +330,7 @@ main =
         putStrLn ""
         -- putStr (concatMap (\(expr, res) -> "> " ++ expr ++ "\n\t" ++ show res ++ "\n\n") parsedExpressions)
         putStr (showWithError finalRes)
+        putStrLn ""
 
         repl finalEnv
         putStrLn "done"
