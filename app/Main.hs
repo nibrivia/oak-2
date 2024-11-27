@@ -57,7 +57,7 @@ setEnv = lift . lift . put
 withTrace :: String -> Computation a -> Computation a
 withTrace str comp = do
   cur_stack <- curStack
-  mapExceptT (local (const (cur_stack ++ [str]))) comp
+  mapExceptT (local (const (str : cur_stack))) comp
 
 curStack :: Computation [String]
 curStack = lift ask
@@ -83,13 +83,20 @@ runInChildEnv comp = do
   let childEnv = makeChildEnv env
   runInEnv childEnv comp
 
+bindFromOtherEnv :: String -> Expression -> Env -> Computation ()
+bindFromOtherEnv name expression exprEnv =
+  -- ADD LAZINESS
+  withTrace ("bindFromOtherEnv " ++ name ++ " = " ++ show expression) $ do
+    (Env mappings parentEnv) <- getEnv
+    let newEnv = mappings & Map.insert name (expression, exprEnv)
+    setEnv (Env newEnv parentEnv)
+
 bind :: String -> Expression -> Computation ()
 bind name expression =
   -- ADD LAZINESS
   withTrace ("bind " ++ name ++ " = " ++ show expression) $ do
-    (Env mappings parentEnv) <- getEnv
-    value <- traceEval expression
-    let newEnv = mappings & Map.insert name (expression, value)
+    env@(Env mappings parentEnv) <- getEnv
+    let newEnv = mappings & Map.insert name (expression, env)
     setEnv (Env newEnv parentEnv)
 
 readBindingExpression :: String -> Computation Expression
@@ -109,8 +116,8 @@ readBinding name = do
   env@(Env mappings parent) <- getEnv
   let lookupRes = Map.lookup name mappings
   case (lookupRes, parent) of
-    (Just (_expr, value), _) ->
-      return value
+    (Just (expr, exprEnv), _) ->
+      runInEnv exprEnv (return expr)
     (Nothing, Just parentEnv) ->
       runInEnv parentEnv (readBinding name)
     (Nothing, Nothing) ->
@@ -132,6 +139,81 @@ traceEval :: Expression -> Computation Expression
 traceEval expr = do
   s <- curStack
   withTrace (show expr) $ eval (expr & debugPipe ("\ntrace:\n" ++ (s & reverse & map ("  . " ++) & unlines) ++ "expr"))
+
+isCallable :: Expression -> Bool
+isCallable (CapturedLambda {}) = True
+isCallable _ = False
+
+isValue :: Expression -> Bool
+isValue (EInteger _) = True
+isValue (EString _) = True
+isValue (EBool _) = True
+isValue (Quote _) = True
+isValue (CapturedLambda {}) = True
+isValue _ = False
+
+smallStep :: Expression -> Computation Expression
+smallStep (Name n) = readBinding n
+smallStep (Lambda argNames bodyExpr) = do
+  env <- getEnv
+  return $ CapturedLambda env argNames bodyExpr
+smallStep (Call (Name "+") [EInteger x, EInteger y]) = return $ EInteger (x + y)
+smallStep (Call (Name "+") [exprA, exprB])
+  | not (isValue exprA) = do
+      astep <- smallStep exprA
+      return $ Call (Name "+") [astep, exprB]
+  | not (isValue exprB) = do
+      bstep <- smallStep exprB
+      return $ Call (Name "+") [exprA, bstep]
+  | otherwise = do
+      throwWithTrace RuntimeError "Don't know how to + these values"
+smallStep (Call (Name "-") [EInteger x, EInteger y]) = return $ EInteger (x - y)
+smallStep (Call (Name "*") [EInteger x, EInteger y]) = return $ EInteger (x * y)
+smallStep (Call (Name "*") [exprA, exprB])
+  | not (isValue exprA) = do
+      astep <- smallStep exprA
+      return $ Call (Name "*") [astep, exprB]
+  | not (isValue exprB) = do
+      bstep <- smallStep exprB
+      return $ Call (Name "*") [exprA, bstep]
+  | otherwise = do
+      return $ Call (Name "*") [exprA, exprB]
+smallStep (Call (Name "/") [EInteger x, EInteger y]) = return $ EInteger (x `div` y)
+smallStep (Call (Name "=") [exprA, exprB])
+    | isValue exprA && isValue exprB = return $ EBool (exprA == exprB)
+    | not (isValue exprA) = do
+        stepA <- smallStep exprA
+        return $ Call (Name "=") [stepA, exprB]
+    | not (isValue exprB) = do
+        stepB <- smallStep exprB
+        return $ Call (Name "=") [exprA, stepB]
+smallStep (Call (Name "eval") [Quote expr]) = smallStep expr
+smallStep (Call (Name "eval") [expr]) = do
+    exprStep <- smallStep expr
+    return $ Call (Name "eval") [exprStep]
+smallStep (Call (CapturedLambda lEnv [] body) []) = do
+  bodyStep <- runInEnv lEnv (smallStep body)
+  if isValue bodyStep
+    then return bodyStep
+    else return (Call (CapturedLambda lEnv [] bodyStep) [])
+smallStep (Call (CapturedLambda lEnv (n : ames) body) (a : rgs)) = do
+  callerEnv <- getEnv
+  newLEnv <- runInEnv lEnv $ do
+    bindFromOtherEnv n a callerEnv
+    getEnv
+  return $ Call (CapturedLambda newLEnv ames body) rgs
+smallStep (Call (Name "enquote") [Name name]) = do
+    expr <- readBinding name
+    return $ Quote expr
+smallStep (Call fn args)
+  | not (isValue fn) = do
+      fnStep <- smallStep fn
+      return $ Call fnStep args
+  | otherwise = throwWithTrace RuntimeError "This part of calling not yet implemented"
+smallStep (Define name expr) = do
+  bind name expr
+  return expr
+smallStep expr = throwWithTrace RuntimeError $ "Not yet implemented: " ++ show expr
 
 eval :: Expression -> Computation Expression
 eval (Call (Name "+") [xExpr, yExpr]) = nativeFn "+" (+) xExpr yExpr
@@ -242,6 +324,20 @@ evalManyStrings str (c : cs) = do
   res <- catchE (rep c) (\err -> return (show err))
   evalManyStrings (str ++ "\n\n> " ++ c ++ "\n" ++ res) cs
 
+manySteps :: Expression -> Computation [Expression]
+manySteps expr = do
+  s <- curStack
+  withTrace (show expr) $ -- eval (expr & debugPipe ("\ntrace:\n" ++ (s & reverse & map ("  . " ++) & unlines) ++ "expr"))
+    if isValue expr
+      then return [expr]
+      else do
+        stepExpr <- smallStep expr
+        if stepExpr == expr
+          then return [expr]
+          else do
+            nextSteps <- manySteps stepExpr
+            return (expr : nextSteps)
+
 rep :: String -> Computation String
 rep input =
   let parseRes =
@@ -249,13 +345,12 @@ rep input =
           & Parsec.parse parseTopExpression "(source)"
    in case parseRes of
         Right expr -> do
-          res <- traceEval expr
+          steps <- manySteps expr
           return $
-            "parsed: "
-              ++ show expr
-              ++ "\n"
-              ++ "eval  : "
-              ++ show res
+            -- "parsed: "
+            --   ++ show expr
+            --   ++ "\n"
+            (map (("-> " ++) . show) steps & unlines)
         Left err -> do
           return $ "error " ++ show err
 
@@ -276,56 +371,58 @@ main =
   let test_cases =
         [ "2",
           "(+ 2 1)",
-          -- "(define name \"olivia\")",
-          -- "name",
-          -- "(define x 5)",
-          -- "x",
-          -- "(quote x)",
-          -- "(eval (quote x))",
-          -- "(+ x 1)",
-          -- "(define y (+ x 2))",
-          -- "(+ x y)",
-          -- "(+ x (* y 3))",
+          "(+ 2 (* 3 5))",
+          "(define name \"olivia\")",
+          "name",
+          "(define x 5)",
+          "x",
+          "(quote x)",
+          "(eval (quote x))",
+          "(+ x 1)",
+          "((lambda (x) (* x x)) 3)",
+          "(define y (+ x 2))",
+          "(+ x y)",
+          "(+ x (* y 3))",
           -- "(let ((a 1)) a)",
           -- "(let ((z 12)) (/ z 4))",
           -- "z",
-          -- "(lambda (arg) (* arg arg))",
-          -- "((lambda (arg) (* arg arg)) 5)",
-          -- "arg",
-          -- "(define square (lambda (arg) (* arg arg)))",
-          -- "(square (quote x))",
-          -- "square",
-          -- "(square)",
-          -- "(square x y)",
-          -- "(square x)",
-          -- "(square z)",
-          -- "(square x)",
-          -- "(define mass (quote m))",
-          -- "mass",
-          -- "m",
-          -- "(eval mass)",
-          -- "(define m 88)",
-          -- "mass",
-          -- "(eval mass)",
-          -- "(quote (square x))",
-          -- "(* (quote height) (quote mass))",
-          -- "(* x (quote mass))",
-          -- "(square (quote x))",
+          "(lambda (arg) (* arg arg))",
+          "((lambda (arg) (* arg arg)) 5)",
+          "arg",
+          "(define square (lambda (arg) (* arg arg)))",
+          "(square (quote x))",
+          "square",
+          "(square)",
+          "(square x y)",
+          "(square x)",
+          "(square z)",
+          "(square x)",
+          "(define mass (quote m))",
+          "mass",
+          "m",
+          "(eval mass)",
+          "(define m 88)",
+          "mass",
+          "(eval mass)",
+          "(quote (square x))",
+          "(* (quote height) (quote mass))",
+          "(* x (quote mass))",
+          "(square (quote x))",
           -- "(eval (quote (square x)))",
           -- "((eval (quote square)) x)",
           -- "(let ((z 12)) x)",
-          -- "(define addToX (lambda (inc) (+ x inc)))",
-          -- "(addToX 3)",
-          -- "(define ke (lambda (mass velocity) (/ (* mass (* velocity velocity)) 2)))",
+          "(define addToX (lambda (inc) (+ x inc)))",
+          "(addToX 3)",
+          "(define ke (lambda (mass velocity) (/ (* mass (* velocity velocity)) 2)))",
           -- "(ke (quote m) 2)",
           -- "(ke (quote m) (quote v))",
           -- "(define capture (lambda (fn) (enquote fn)))",
           -- "(capture ke)",
-          -- "(define plus (lambda (x y) (+ x y)))",
-          -- "(plus 2 3)",
-          -- "(define isPlus (lambda (fn) (= (enquote fn) (quote (quote plus)))))",
-          -- "(isPlus plus)",
-          -- "(isPlus ke)",
+          "(define plus (lambda (x y) (+ x y)))",
+          "(plus 2 3)",
+          "(define isPlus (lambda (fn) (= (enquote fn) (quote plus))))",
+          "(isPlus plus)",
+          "(isPlus ke)",
           -- "(define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))",
           -- "(fact 0)",
           -- "(fact 1)",
@@ -339,15 +436,15 @@ main =
           -- "(tail xs)",
           -- "(define defun (lambda (fnName argName body) (bind fnName (quote (lambda (argValue) (bindIn argName argValue (eval body)))))))",
           -- "(defun (quote s) (quote num) (quote (+ num 97)))",
-          "(bind (quote v) 3)",
-          "v",
-          "(define myBind (lambda (name value) ((quote bind) (enquote name) value)))",
-          "(eval ((quote bind) (quote t) 5))",
-          "(myBind u 5)",
-          "u",
+          -- "(bind (quote v) 3)",
+          -- "v",
+          -- "(define myBind (lambda (name value) ((quote bind) (enquote name) value)))",
+          -- "(eval ((quote bind) (quote t) 5))",
+          -- "(myBind u 5)",
+          -- "u",
           -- "(define tBind (myBind (quote t) 5))",
           -- "(eval (eval tBind))",
-          "t",
+          -- "t",
           -- "(bind (quote s) square)",
           -- "(define s square)",
           -- "(s 3)",

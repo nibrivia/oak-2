@@ -30,7 +30,7 @@ data Expression
 
 -- deriving (Show)
 
-data Env = Env (Map.Map String (Expression, Expression)) (Maybe Env) deriving (Show, Eq)
+data Env = Env (Map.Map String (Expression, Env)) (Maybe Env) deriving (Show, Eq)
 
 instance Show Expression where
   show (EInteger x) = show x
@@ -45,7 +45,7 @@ instance Show Expression where
   show (IfElse cond trueExpr falseExpr) = "(if " ++ show cond ++ " " ++ show trueExpr ++ " " ++ show falseExpr ++ ")"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
   show (Call fn args) = "(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
-  show (CapturedLambda env argNames body) = "<Captured Lambda: " ++ show (Lambda argNames body) ++ " in env:\n  " ++ show env ++ "\n  >"
+  show (CapturedLambda env argNames body) = "<Captured Lambda: " ++ show (Lambda argNames body) ++ ")" -- in env:\n  " ++ show env ++ "\n  >"
   show _ = "(don't know how to display this expression)"
 
 parseName :: Parsec.Parsec String () Expression
