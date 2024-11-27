@@ -28,7 +28,7 @@ data Error = Error
 
 instance Show Error where
   show (Error eType msg sTrace) =
-    show eType ++ ": " ++ msg ++ " in:\n" ++ (sTrace & map (" > " ++) & reverse & unlines)
+    (sTrace & map ("  " ++) & reverse & unlines) ++ "  \x1b[1;31m" ++ show eType ++ ":\x1b[0m\x1b[1m " ++ msg ++ "\x1b[0m"
 
 debugPipe :: (Show b) => String -> b -> b
 debugPipe name x = trace (name ++ ": " ++ show x) x
@@ -150,6 +150,7 @@ isValue (EString _) = True
 isValue (EBool _) = True
 isValue (Quote _) = True
 isValue (CapturedLambda {}) = True
+-- isValue (Call (CapturedLambda lEnv [] body) _) = True
 isValue _ = False
 
 smallStep :: Expression -> Computation Expression
@@ -168,6 +169,15 @@ smallStep (Call (Name "+") [exprA, exprB])
   | otherwise = do
       throwWithTrace RuntimeError "Don't know how to + these values"
 smallStep (Call (Name "-") [EInteger x, EInteger y]) = return $ EInteger (x - y)
+smallStep (Call (Name "-") [exprA, exprB])
+  | not (isValue exprA) = do
+      astep <- smallStep exprA
+      return $ Call (Name "-") [astep, exprB]
+  | not (isValue exprB) = do
+      bstep <- smallStep exprB
+      return $ Call (Name "-") [exprA, bstep]
+  | otherwise = do
+      throwWithTrace RuntimeError "Don't know how to - these values"
 smallStep (Call (Name "*") [EInteger x, EInteger y]) = return $ EInteger (x * y)
 smallStep (Call (Name "*") [exprA, exprB])
   | not (isValue exprA) = do
@@ -180,39 +190,56 @@ smallStep (Call (Name "*") [exprA, exprB])
       return $ Call (Name "*") [exprA, exprB]
 smallStep (Call (Name "/") [EInteger x, EInteger y]) = return $ EInteger (x `div` y)
 smallStep (Call (Name "=") [exprA, exprB])
-    | isValue exprA && isValue exprB = return $ EBool (exprA == exprB)
-    | not (isValue exprA) = do
-        stepA <- smallStep exprA
-        return $ Call (Name "=") [stepA, exprB]
-    | not (isValue exprB) = do
-        stepB <- smallStep exprB
-        return $ Call (Name "=") [exprA, stepB]
+  | isValue exprA && isValue exprB = return $ EBool (exprA == exprB)
+  | not (isValue exprA) = do
+      stepA <- smallStep exprA
+      return $ Call (Name "=") [stepA, exprB]
+  | not (isValue exprB) = do
+      stepB <- smallStep exprB
+      return $ Call (Name "=") [exprA, stepB]
 smallStep (Call (Name "eval") [Quote expr]) = smallStep expr
 smallStep (Call (Name "eval") [expr]) = do
-    exprStep <- smallStep expr
-    return $ Call (Name "eval") [exprStep]
+  exprStep <- smallStep expr
+  return $ Call (Name "eval") [exprStep]
+smallStep (Call (Name "enquote") [Name name]) = do
+  expr <- readBinding name
+  return $ Quote expr
 smallStep (Call (CapturedLambda lEnv [] body) []) = do
-  bodyStep <- runInEnv lEnv (smallStep body)
-  if isValue bodyStep
-    then return bodyStep
-    else return (Call (CapturedLambda lEnv [] bodyStep) [])
+  return $ InEnv lEnv body
+smallStep expr@(Call (CapturedLambda lEnv [] body) args@(_ : _)) = do
+  let newLambda = InEnv lEnv body
+  -- throwWithTrace RuntimeError $ "too many args: " ++ show expr ++ "alt: " ++ show newLambda
+  return $ Call newLambda args
+smallStep (Call (CapturedLambda lEnv argNames@(_ : _) body) []) = do
+  return (CapturedLambda lEnv argNames body)
 smallStep (Call (CapturedLambda lEnv (n : ames) body) (a : rgs)) = do
   callerEnv <- getEnv
   newLEnv <- runInEnv lEnv $ do
-    bindFromOtherEnv n a callerEnv
+    bind n (InEnv callerEnv a)
     getEnv
   return $ Call (CapturedLambda newLEnv ames body) rgs
-smallStep (Call (Name "enquote") [Name name]) = do
-    expr <- readBinding name
-    return $ Quote expr
-smallStep (Call fn args)
+smallStep expr@(Call fn args)
   | not (isValue fn) = do
       fnStep <- smallStep fn
       return $ Call fnStep args
-  | otherwise = throwWithTrace RuntimeError "This part of calling not yet implemented"
+  | otherwise = throwWithTrace RuntimeError $ "This part of calling not yet implemented" ++ show expr
+smallStep (InEnv env expr) =
+  if isValue expr
+    then return expr
+    else do
+      stepExpr <- runInEnv env $ smallStep expr
+      return $ InEnv env stepExpr
+smallStep (IfElse (EBool True) tExpr _) = return tExpr
+smallStep (IfElse (EBool False) _ fExpr) = return fExpr
+smallStep expr@(IfElse condExpr tExpr fExpr) =
+  if not (isValue condExpr)
+    then do
+      condStep <- smallStep condExpr
+      return $ IfElse condStep tExpr fExpr
+    else throwWithTrace RuntimeError $ "If badly formed: " ++ show expr
 smallStep (Define name expr) = do
   bind name expr
-  return expr
+  return $ Quote expr
 smallStep expr = throwWithTrace RuntimeError $ "Not yet implemented: " ++ show expr
 
 eval :: Expression -> Computation Expression
@@ -324,19 +351,21 @@ evalManyStrings str (c : cs) = do
   res <- catchE (rep c) (\err -> return (show err))
   evalManyStrings (str ++ "\n\n> " ++ c ++ "\n" ++ res) cs
 
-manySteps :: Expression -> Computation [Expression]
-manySteps expr = do
-  s <- curStack
-  withTrace (show expr) $ -- eval (expr & debugPipe ("\ntrace:\n" ++ (s & reverse & map ("  . " ++) & unlines) ++ "expr"))
-    if isValue expr
-      then return [expr]
-      else do
-        stepExpr <- smallStep expr
-        if stepExpr == expr
+manySteps :: Int -> Expression -> Computation [Expression]
+manySteps maxSteps expr =
+  if maxSteps <= 0
+    then return [expr]
+    else do
+      withTrace (show expr) $ -- eval (expr & debugPipe ("\ntrace:\n" ++ (s & reverse & map ("  . " ++) & unlines) ++ "expr"))
+        if isValue expr
           then return [expr]
           else do
-            nextSteps <- manySteps stepExpr
-            return (expr : nextSteps)
+            stepExpr <- smallStep expr
+            if stepExpr == expr
+              then return [expr]
+              else do
+                nextSteps <- manySteps (maxSteps - 1) stepExpr
+                return (expr : nextSteps)
 
 rep :: String -> Computation String
 rep input =
@@ -345,12 +374,12 @@ rep input =
           & Parsec.parse parseTopExpression "(source)"
    in case parseRes of
         Right expr -> do
-          steps <- manySteps expr
+          steps <- manySteps 100 expr
           return $
             -- "parsed: "
             --   ++ show expr
             --   ++ "\n"
-            (map (("-> " ++) . show) steps & unlines)
+            (map (("  " ++) . show) steps & unlines)
         Left err -> do
           return $ "error " ++ show err
 
@@ -420,17 +449,21 @@ main =
           -- "(capture ke)",
           "(define plus (lambda (x y) (+ x y)))",
           "(plus 2 3)",
-          "(define isPlus (lambda (fn) (= (enquote fn) (quote plus))))",
-          "(isPlus plus)",
-          "(isPlus ke)",
-          -- "(define fact (lambda (n) (if (= n 0) 1 (* n (fact (- n 1))))))",
-          -- "(fact 0)",
-          -- "(fact 1)",
+          -- "(define isPlus (lambda (fn) (= (enquote fn) (quote plus))))",
+          -- "(isPlus plus)",
+          -- "(isPlus ke)",
+          -- "(define ycomb (lambda (fn) ((lambda (x) (fn x x)) (lambda (x) (fn x x)))  ))",
+          "(define add (lambda (a) (lambda (b) (+ b a))))",
+          "(add 2 3)",
+          "(define inc (add 1))",
+          "(inc 2)",
+          "(define ycomb (lambda (fn) ((lambda (x) (fn (lambda (y) (x x y)))) (lambda (x) (fn (lambda (y) (x x y)))))  ))",
+          "(define factHelper (lambda (factRec n) (if (= n 0) 1 (* n (factRec (- n 1))))))",
+          "(define fact (ycomb factHelper))",
+          "(fact 0)",
+          "(fact 1)",
           -- "(bind (quote boundName) 1)",
           -- "boundName",
-          -- "(define add (lambda (a) (lambda (b) (+ b a))))",
-          -- "(define inc (add 1))",
-          -- "(inc 2)",
           -- "(define xs (list 1 2 3))",
           -- "(head xs)",
           -- "(tail xs)",

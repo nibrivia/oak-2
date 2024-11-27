@@ -21,6 +21,7 @@ data Expression
   | Lambda [String] Expression
   | Let [(String, Expression)] Expression
   | CapturedLambda Env [String] Expression
+  | InEnv Env Expression
   | Quote Expression
   | IfElse Expression Expression Expression
   | Define String Expression
@@ -43,6 +44,7 @@ instance Show Expression where
   -- show (CapturedLambda _ _) = "<captured lambda>"
   show (Quote expr) = "(quote " ++ show expr ++ ")"
   show (IfElse cond trueExpr falseExpr) = "(if " ++ show cond ++ " " ++ show trueExpr ++ " " ++ show falseExpr ++ ")"
+  show (InEnv env expr) = "[" ++ show expr ++ "]"
   show (Define name expr) = "(define " ++ name ++ " " ++ show expr ++ ")"
   show (Call fn args) = "(" ++ show fn ++ " " ++ (args & map show & unwords) ++ ")"
   show (CapturedLambda env argNames body) = "<Captured Lambda: " ++ show (Lambda argNames body) ++ ")" -- in env:\n  " ++ show env ++ "\n  >"
