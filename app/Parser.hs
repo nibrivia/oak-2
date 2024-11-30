@@ -31,7 +31,7 @@ data Expression
 
 -- deriving (Show)
 
-data Env = Env (Map.Map String (Expression, Env)) (Maybe Env) deriving (Show, Eq)
+data Env = Env (Map.Map String Expression) (Maybe Env) deriving (Show, Eq)
 
 instance Show Expression where
   show (EInteger x) = show x
